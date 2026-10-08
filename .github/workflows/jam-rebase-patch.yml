@@ -1,4 +1,6 @@
-# Keeps Band's fork deltas from going stale (see FORK-CHANGES.md).
+# Keeps Band's fork deltas from going stale (see FORK-CHANGES.md). GitHub
+# indexes workflows only when the file changes on the default branch, so this
+# header carries that note; a no-op content change here registers dispatch.
 #
 # thenvoi/tjam consumes this fork rev-pinned through a release tarball based on
 # one upstream version tag. Taking an upgrade in tjam therefore needs the
