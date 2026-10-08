@@ -234,12 +234,20 @@ describe("remap after a prepend (delta 6)", () => {
   it("completing the shift transaction keeps the anchor and dispatches nothing further", async () => {
     const ADDED = 20;
     const handle = createRef<VirtualizerHandle>();
+    // The first seven rows are 60px tall while every other row is 30px, so
+    // measured identity is observable: with the remap applied, the 60px cache
+    // entries must sit at the shifted indices; with a no-op remap they stay
+    // behind, still claiming indices 0–6 are 60px.
+    const heightOf = (item: string) => {
+      const n = Number(item.slice("item-".length));
+      return n >= 0 && n < 7 ? 60 : 30;
+    };
     let items = range(200, (i) => `item-${i}`);
     const root = render(
       <div style={{ height: 400, overflowY: "auto" }}>
         <Virtualizer ref={handle} data={items} itemSize={30}>
           {(item) => (
-            <div key={item} style={{ height: 30 }}>
+            <div key={item} style={{ height: heightOf(item) }}>
               {item}
             </div>
           )}
@@ -264,7 +272,7 @@ describe("remap after a prepend (delta 6)", () => {
       <div style={{ height: 400, overflowY: "auto" }}>
         <Virtualizer ref={handle} data={items} itemSize={30} shift>
           {(item) => (
-            <div key={item} style={{ height: 30 }}>
+            <div key={item} style={{ height: heightOf(item) }}>
               {item}
             </div>
           )}
@@ -299,9 +307,55 @@ describe("remap after a prepend (delta 6)", () => {
     await nextFrame();
     closeWitness();
 
-    // the remap itself must not displace the reader: geometry was already
+    // The remap itself must not displace the reader: geometry was already
     // compensated by the shift transaction it completes. (Unrelated
     // measurement follow-ups may write; the anchor check is the contract.)
+    expect(Math.abs(relativeTop(viewport, anchor) - afterFirst)).toBeLessThanOrEqual(
+      SUBPIXEL,
+    );
+
+    // Remap-specific outcome: a same-length reorder moves identity that NO
+    // shift transaction can express — the measured 60px row (index 20 = old
+    // item-0) swaps with an unmeasured row far below (index 100), and the
+    // cache sizes must follow the content. Under a no-op remap the measured
+    // entry stays behind at index 20: every later correction, offset, and
+    // removal would then be priced for the wrong rows. This is what makes
+    // the case distinguish remapItems from `() => true`; the mounted
+    // reader's rows are unaffected either way (both swapped rows sit above
+    // the mounted range and their total below it is unchanged), so the
+    // anchor-stability contract still holds.
+    const swapped = [...items];
+    const movedRow = swapped[20]!;
+    swapped[20] = swapped[100]!;
+    swapped[100] = movedRow;
+    items = swapped;
+    rerender(
+      root,
+      <div style={{ height: 400, overflowY: "auto" }}>
+        <Virtualizer ref={handle} data={items} itemSize={30}>
+          {(item) => (
+            <div key={item} style={{ height: heightOf(item) }}>
+              {item}
+            </div>
+          )}
+        </Virtualizer>
+      </div>,
+    );
+    const order = range(items.length, (i) => i);
+    const movedOrder = order[20]!;
+    order[20] = order[100]!;
+    order[100] = movedOrder;
+    openWitness();
+    expect(
+      handle.current!.remapItems({ previousLength: items.length, order }),
+    ).toBe(true);
+    await nextFrame();
+    closeWitness();
+    expect(witness.flushes.every(([jump]) => jump === 0)).toBe(true);
+    // The measured size followed the content, and the never-measured slot
+    // reads the estimate — under a stale identity these two are swapped.
+    expect(handle.current!.getItemSize(100)).toBe(60);
+    expect(handle.current!.getItemSize(20)).toBe(30);
     expect(Math.abs(relativeTop(viewport, anchor) - afterFirst)).toBeLessThanOrEqual(
       SUBPIXEL,
     );
@@ -323,7 +377,11 @@ describe("cached row identity across a correction-producing resize (delta 4)", (
     const renderRow = vi.fn((item: string) => <div>{item}</div>);
     const root = render(
       <div style={{ height: 400, overflowY: "auto" }}>
-        <Virtualizer data={DATA} itemSize={60}>
+        {/* index 49's bottom rests exactly at the viewport top once settled
+        at 3000; keepMounted guarantees that fully-above row is mounted on
+        every engine regardless of the range boundary, so the grown-row
+        selection below is deterministic, not subpixel-dependent. */}
+        <Virtualizer data={DATA} itemSize={60} keepMounted={[49]}>
           {renderRow}
         </Virtualizer>
       </div>,

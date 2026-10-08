@@ -200,6 +200,7 @@ describe("prepend committed between two scroll deliveries while scrolling toward
     // the older page commits in the gap between the two deliveries
     items = [...range(ADDED, (i) => `item-${i - ADDED}`), ...items];
     openWitness();
+openWitness();
     rerender(root, <List items={items} shift />);
     // React root renders commit asynchronously — the shift correction lands
     // with the commit, so the witness stays open until a NONZERO jump
@@ -209,6 +210,16 @@ describe("prepend committed between two scroll deliveries while scrolling toward
       .toBe(true);
     await nextFrame();
     closeWitness();
+
+    // OUTCOME (plan U1 step 5): between the compensation dispatch and the
+    // next deliberate scroll, the anchor row sits exactly where it sat
+    // before the prepend committed. With the correction suppressed the rows
+    // keep their document positions, the anchor drifts by the full shift
+    // (or unmounts) and this fails before the trajectory step can mask it.
+    expect(anchor.isConnected).toBe(true);
+    expect(Math.abs(relativeTop(viewport, anchor) - afterFirst)).toBeLessThanOrEqual(
+      SUBPIXEL,
+    );
 
     const second = onceScroll(viewport);
     viewport.scrollTop -= 100; // the gesture's next delivered scroll
@@ -316,6 +327,11 @@ describe("edge corrections use the absolute branch", () => {
     await expect.poll(() => getItem(container, "2")).toBeDefined();
     await expect.poll(() => handle.current!.isUnmeasuredItem(2)).toBe(false);
 
+    // OUTCOME (plan U1 step 5): sample a visible row BEFORE the growth; the
+    // absolute end-write must re-anchor it, not merely land at the end.
+    const anchor = findFirstVisibleItem(container, viewport)!;
+    const before = relativeTop(viewport, anchor);
+
     // grow row 2 by 400px through a direct DOM mutation — the engine-robust
     // trigger proven by the resize case in the react-level suite.
     const grown = getItem(container, "2") as HTMLElement;
@@ -328,6 +344,13 @@ describe("edge corrections use the absolute branch", () => {
     closeWitness();
 
     expect(witness.writes).toContain("absolute");
+
+    // The same row, unMOVED by the growth — the outcome this case pins; the
+    // distance-to-end check alone could pass by accident under suppression.
+    expect(anchor.isConnected).toBe(true);
+    expect(Math.abs(relativeTop(viewport, anchor) - before)).toBeLessThanOrEqual(
+      SUBPIXEL,
+    );
 
     // growing content above while the reader is at the end: the absolute
     // write re-anchors exactly at the grown end — not past it, not short.
