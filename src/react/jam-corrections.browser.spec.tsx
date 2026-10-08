@@ -16,9 +16,15 @@ import {
 } from "../../spec/browser/index.js";
 import { render, rerender } from "../../spec/browser/react.js";
 import { delay, nextFrame, range } from "../../spec/utils.js";
+// The witness mock wraps core's scroll observer, so its TYPE surface must be
+// named where it lives; the zone rule exists to keep runtime code layered —
+// these are type-only imports and the vi.mock path string must resolve to
+// core/observer.js exactly.
+/* eslint-disable import/no-restricted-paths */
 import type * as Observed from "../core/observer.js";
 import type { VirtualStore } from "../core/store.js";
 import type { ScrollObserver } from "../core/observer.js";
+/* eslint-enable import/no-restricted-paths */
 
 afterEach(cleanupScroll);
 
