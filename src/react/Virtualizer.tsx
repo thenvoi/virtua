@@ -29,7 +29,7 @@ import {
   sort,
 } from "../core/index.js";
 import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
-import { getKey, refKey } from "./utils.js";
+import { getKey, refKey, type ItemElement as CachedRowElement } from "./utils.js";
 import { useStatic } from "./useStatic.js";
 import { useLatestRef } from "./useLatestRef.js";
 import { ListItem } from "./ListItem.js";
@@ -249,10 +249,33 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
     const isScrolling = store.$isScrolling();
     const totalSize = store.$getTotalSize();
 
+    // Identity cache: retain each renderElement(index) result across Virtualizer-only
+    // re-renders (native scroll, resize, etc.) so an unchanged mounted row keeps
+    // the same `_children` identity and ListItem's memo can bail. Invalidated
+    // wholesale whenever `renderElement` itself is a new reference — useChildren
+    // guarantees that whenever the caller's `children` (render function) or
+    // `data` identity changes, i.e. every input this row depends on. Bounded to
+    // the indices actually rendered this pass (below) so scrolling cannot grow
+    // it unbounded. See FORK-CHANGES.md delta 4.
+    const elementCache = useRef<{
+      fn: typeof renderElement | null;
+      cache: Map<number, CachedRowElement>;
+    }>({ fn: null, cache: new Map() });
+    if (elementCache[refKey].fn !== renderElement) {
+      elementCache[refKey] = { fn: renderElement, cache: new Map() };
+    }
+    const renderedIndices = new Set<number>();
+
     const items: ReactElement[] = [];
 
     const renderItem = (index: number) => {
-      const e = renderElement(index);
+      renderedIndices.add(index);
+      const cache = elementCache[refKey].cache;
+      let e = cache.get(index);
+      if (e === undefined) {
+        e = renderElement(index);
+        cache.set(index, e);
+      }
 
       return (
         <ListItem
@@ -350,6 +373,12 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
     } else {
       for (let [i, j] = store.$getRange(bufferSize); i <= j; i++) {
         items.push(renderItem(i));
+      }
+    }
+
+    for (const cachedIndex of elementCache[refKey].cache.keys()) {
+      if (!renderedIndices.has(cachedIndex)) {
+        elementCache[refKey].cache.delete(cachedIndex);
       }
     }
 
