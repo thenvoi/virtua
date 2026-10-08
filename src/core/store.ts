@@ -1,5 +1,5 @@
 import { isIOSWebKit } from "./environment.js";
-import type { Layout } from "./layouts/types.js";
+import type { ItemSizeEstimator, Layout } from "./layouts/types.js";
 import type { ItemResize, ItemsRange } from "./types.js";
 import { abs, max, min, NULL } from "./utils.js";
 
@@ -37,6 +37,8 @@ export const ACTION_START_OFFSET_CHANGE = 7;
 export const ACTION_MANUAL_SCROLL = 8;
 /** @internal */
 export const ACTION_BEFORE_MANUAL_SMOOTH_SCROLL = 9;
+/** @internal */
+export const ACTION_ITEM_SIZE_ESTIMATOR_CHANGE = 10;
 
 type Actions =
   | [type: typeof ACTION_SCROLL, offset: number]
@@ -51,7 +53,11 @@ type Actions =
   | [type: typeof ACTION_RELAYOUT, jump: number]
   | [type: typeof ACTION_START_OFFSET_CHANGE, offset: number]
   | [type: typeof ACTION_MANUAL_SCROLL, dummy?: void]
-  | [type: typeof ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, offset: number];
+  | [type: typeof ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, offset: number]
+  | [
+      type: typeof ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
+      estimator: ItemSizeEstimator | null,
+    ];
 
 /** @internal */
 export const UPDATE_VIRTUAL_STATE = 0b0001;
@@ -130,6 +136,7 @@ export const createVirtualStore = (
     $getLength: getLength,
     $setLength: setLength,
     $isEstimating: isEstimating,
+    $setEstimator: setEstimator,
   }: Layout,
   ssrCount: number = 0,
 ): VirtualStore => {
@@ -412,6 +419,20 @@ export const createVirtualStore = (
         }
         case ACTION_MANUAL_SCROLL: {
           _scrollMode = SCROLL_BY_MANUAL_SCROLL;
+          break;
+        }
+        case ACTION_ITEM_SIZE_ESTIMATOR_CHANGE: {
+          // Fork delta 5: an estimator swap is a geometry mutation. Use the
+          // same anchor as measurement and relayout, including shift and
+          // frozen-range modes, then pass its delta through the existing hold.
+          if (setEstimator) {
+            const anchorIndex = getAnchorIndex();
+            const anchorOffset = getItemOffset(anchorIndex);
+            if (setEstimator(payload)) {
+              applyJump(getItemOffset(anchorIndex) - anchorOffset);
+              mutated = UPDATE_VIRTUAL_STATE;
+            }
+          }
           break;
         }
         case ACTION_BEFORE_MANUAL_SMOOTH_SCROLL: {
