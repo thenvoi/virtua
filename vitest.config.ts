@@ -126,7 +126,7 @@ export default defineConfig({
           expect: browserPoll,
           include: ["src/react/*.browser.spec.tsx"],
           browser: {
-            ...testBrowser("chromium"),
+            ...testBrowser("chromium", "webkit"),
             commands: ssrCommands("/spec/ssr/react.tsx"),
           },
         },
