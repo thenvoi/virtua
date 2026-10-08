@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createRef, type Ref, useImperativeHandle, useState } from "react";
-import { Virtualizer } from "./react/index.js";
+import { createRef } from "react";
+import { Virtualizer, type VirtualizerHandle } from "./react/index.js";
 import {
   cleanupScroll,
   findFirstVisibleItem,
@@ -233,93 +233,107 @@ describe("prepend committed between two scroll deliveries while scrolling toward
 });
 
 describe("edge corrections use the absolute branch", () => {
-  it("absolute-top: rows above the viewport collapsing near the start dispatches from + jump <= 0", async () => {
-    const ref = createRef<{ collapse: () => void }>();
-    const Collapsers = ({ ref: r }: { ref: Ref<{ collapse: () => void }> }) => {
-      const [small, setSmall] = useState(false);
-      useImperativeHandle(r, () => ({ collapse: () => setSmall(true) }), []);
-      return (
-        <div style={{ height: 300, overflowY: "auto" }}>
-          <Virtualizer data={range(20)} itemSize={100}>
-            {(i) => (
-              <div style={{ height: small && i < 2 ? 0 : 100 }}>{i}</div>
-            )}
-          </Virtualizer>
-        </div>
-      );
-    };
-    const root = render(<Collapsers ref={ref} />);
+  it("absolute-top: removing rows at the start with shift dispatches the edge write at to <= 0", async () => {
+    // Two measured rows above the viewport are removed from the start with
+    // shift=true; the shift shrink prices both removals (-200) and the
+    // scroll sits exactly at the old row-2 edge (from 200): to = 0 → the
+    // absolute branch. (Filter-away-at-top is the shape Band's feed
+    // produces; a zero-height ResizeObserver entry is engine-fragile, so
+    // the edge is reached through the length-change path.)
+    const handle = createRef<VirtualizerHandle>();
+    let items = range(20, (i) => `row-${i}`);
+    const root = render(
+      <div style={{ height: 300, overflowY: "auto" }}>
+        <Virtualizer ref={handle} data={items} itemSize={100}>
+          {(item) => (
+            <div key={item} style={{ height: 100 }}>
+              {item}
+            </div>
+          )}
+        </Virtualizer>
+      </div>,
+    );
     const { viewport, container } = await getVirtualizer(root);
-    await expect.poll(() => getItem(container, "2")).toBeDefined();
+    await expect.poll(() => getItem(container, "row-0")).toBeDefined();
 
-    viewport.scrollTop = 200; // row 2's top edge; rows 0–1 fully above
+    viewport.scrollTop = 200; // top of row-2; rows 0–1 fully above
     await settle(viewport);
-    const anchor = getItem(container, "2")!;
-    const before = relativeTop(viewport, anchor);
+    // precondition: both rows above are MEASURED at 100 (their entries exist).
+    await expect.poll(() => handle.current!.isUnmeasuredItem(0)).toBe(false);
+    await expect.poll(() => handle.current!.isUnmeasuredItem(1)).toBe(false);
+    const anchor = getItem(container, "row-2")!;
+    const before = relativeTop(viewport, anchor); // 0 — top of viewport
 
+    items = items.slice(2);
     openWitness();
-    ref.current!.collapse();
+    rerender(
+      root,
+      <div style={{ height: 300, overflowY: "auto" }}>
+        <Virtualizer ref={handle} data={items} itemSize={100} shift>
+          {(item) => (
+            <div key={item} style={{ height: 100 }}>
+              {item}
+            </div>
+          )}
+        </Virtualizer>
+      </div>,
+    );
     await expect
       .poll(() => witness.flushes.some(([jump]) => jump !== 0))
       .toBe(true);
     await nextFrame();
     closeWitness();
-    await nextFrame();
 
-    // from(200) + jump(-200) <= 0 → absolute branch (scrollTo), no scrollBy.
-    expect(witness.flushes.some(([jump]) => jump !== 0)).toBe(true);
+    // to(0) <= 0 → absolute; the reader keeps row-2 at the same spot.
     expect(witness.writes).toContain("absolute");
     expect(witness.writes).not.toContain("relative");
-
-    // rows 0–1 collapse away; row 2 lands at the start, where it already was.
     expect(Math.abs(relativeTop(viewport, anchor) - before)).toBeLessThanOrEqual(
       SUBPIXEL,
     );
   });
 
-  it("absolute-end: rows above the viewport growing at the bottom dispatches to >= end", async () => {
-    const ref = createRef<{ grow: () => void }>();
-    const Growers = ({ ref: r }: { ref: Ref<{ grow: () => void }> }) => {
-      const [big, setBig] = useState(false);
-      useImperativeHandle(r, () => ({ grow: () => setBig(true) }), []);
-      return (
-        <div style={{ height: 300, overflowY: "auto" }}>
-          <Virtualizer data={range(20)} itemSize={100} keepMounted={[2]}>
-            {(i) => (
-              <div key={i} style={{ height: big && i === 2 ? 500 : 100 }}>
-                {i}
-              </div>
-            )}
-          </Virtualizer>
-        </div>
-      );
-    };
-    const root = render(<Growers ref={ref} />);
+  it("absolute-end: rows above the viewport growing at the bottom dispatches from >= end", async () => {
+    const handle = createRef<VirtualizerHandle>();
+    const root = render(
+      <div style={{ height: 300, overflowY: "auto" }}>
+        <Virtualizer ref={handle} data={range(20)} itemSize={100} keepMounted={[2]}>
+          {(i) => (
+            <div key={i} style={{ height: 100 }}>
+              {i}
+            </div>
+          )}
+        </Virtualizer>
+      </div>,
+    );
     const { viewport, container } = await getVirtualizer(root);
     await expect.poll(() => getItem(container, "0")).toBeDefined();
 
     scrollToEnd(viewport); // from >= end
     await settle(viewport);
     await expect.poll(() => getItem(container, "19")).toBeDefined();
+    // keepMounted items render after the visible range in DOM order, so
+    // select by content, not by position. precondition: row 2 measured.
+    await expect.poll(() => getItem(container, "2")).toBeDefined();
+    await expect.poll(() => handle.current!.isUnmeasuredItem(2)).toBe(false);
 
+    // grow row 2 by 400px through a direct DOM mutation — the engine-robust
+    // trigger proven by the resize case in the react-level suite.
+    const grown = getItem(container, "2") as HTMLElement;
     openWitness();
-    ref.current!.grow();
+    grown.style.height = "500px";
     await expect
       .poll(() => witness.flushes.some(([jump]) => jump !== 0))
       .toBe(true);
     await nextFrame();
     closeWitness();
-    await nextFrame();
 
-    expect(witness.flushes.some(([jump]) => jump !== 0)).toBe(true);
     expect(witness.writes).toContain("absolute");
 
     // growing content above while the reader is at the end: the absolute
     // write re-anchors exactly at the grown end — not past it, not short.
-    const total = 19 * 100 + 500;
-    expect(
-      Math.abs(viewport.scrollTop + viewport.clientHeight - total),
-    ).toBeLessThanOrEqual(SUBPIXEL);
+    await expect
+      .poll(() => viewport.scrollHeight - (viewport.scrollTop + viewport.clientHeight))
+      .toBeLessThanOrEqual(SUBPIXEL);
   });
 });
 
