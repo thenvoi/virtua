@@ -57,7 +57,9 @@ jobs:
         run: |
           set -euo pipefail
           npm run build
-          npm pack --filename "${{ steps.stamp.outputs.tarball }}"
+          packed=$(npm pack | tail -1) # npm 11 dropped --filename; the
+          # stamped version makes pack emit virtua-<version>.tgz itself.
+          [ "$packed" = "${{ steps.stamp.outputs.tarball }}" ] || mv "$packed" "${{ steps.stamp.outputs.tarball }}"
 
       - name: Publish the release
         env:
