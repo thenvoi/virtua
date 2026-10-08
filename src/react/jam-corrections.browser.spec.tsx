@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  createRef,
-  type Ref,
-  useImperativeHandle,
-  useState,
-} from "react";
+import { createRef, type Ref, useImperativeHandle, useState } from "react";
 import { Virtualizer, type VirtualizerHandle } from "./index.js";
 import {
   cleanupScroll,
@@ -156,11 +151,7 @@ const EST_ROWS = 500;
 const EST_BASE = 30;
 const EST_SWAPPED = 45;
 
-const EstimatorList = ({
-  ref,
-}: {
-  ref: Ref<{ swap: () => void }>;
-}) => {
+const EstimatorList = ({ ref }: { ref: Ref<{ swap: () => void }> }) => {
   const [swapped, setSwapped] = useState(false);
   useImperativeHandle(ref, () => ({ swap: () => setSwapped(true) }), []);
   // a real swap: distinct reference, different per-index pricing
@@ -207,9 +198,9 @@ describe("estimator swap during scrolling (delta 5)", () => {
     expect(witness.writes).toContain("relative");
     expect(witness.writes).not.toContain("absolute");
 
-    expect(Math.abs(relativeTop(viewport, anchor) - afterFirst)).toBeLessThanOrEqual(
-      SUBPIXEL,
-    );
+    expect(
+      Math.abs(relativeTop(viewport, anchor) - afterFirst),
+    ).toBeLessThanOrEqual(SUBPIXEL);
   });
 
   it("verify-red: with the correction suppressed the anchor moves by the repricing", async () => {
@@ -304,10 +295,7 @@ describe("remap after a prepend (delta 6)", () => {
     expect(
       handle.current!.remapItems({
         previousLength: 200,
-        order: [
-          ...range(ADDED, () => -1),
-          ...range(200, (i) => i),
-        ],
+        order: [...range(ADDED, () => -1), ...range(200, (i) => i)],
       }),
     ).toBe(true);
     await nextFrame();
@@ -316,9 +304,9 @@ describe("remap after a prepend (delta 6)", () => {
     // The remap itself must not displace the reader: geometry was already
     // compensated by the shift transaction it completes. (Unrelated
     // measurement follow-ups may write; the anchor check is the contract.)
-    expect(Math.abs(relativeTop(viewport, anchor) - afterFirst)).toBeLessThanOrEqual(
-      SUBPIXEL,
-    );
+    expect(
+      Math.abs(relativeTop(viewport, anchor) - afterFirst),
+    ).toBeLessThanOrEqual(SUBPIXEL);
 
     // Remap-specific outcome: a same-length reorder moves identity that NO
     // shift transaction can express — the measured 60px row (index 20 = old
@@ -362,9 +350,9 @@ describe("remap after a prepend (delta 6)", () => {
     // reads the estimate — under a stale identity these two are swapped.
     expect(handle.current!.getItemSize(100)).toBe(60);
     expect(handle.current!.getItemSize(20)).toBe(30);
-    expect(Math.abs(relativeTop(viewport, anchor) - afterFirst)).toBeLessThanOrEqual(
-      SUBPIXEL,
-    );
+    expect(
+      Math.abs(relativeTop(viewport, anchor) - afterFirst),
+    ).toBeLessThanOrEqual(SUBPIXEL);
 
     const second = onceScroll(viewport);
     viewport.scrollTop -= 100;
@@ -410,8 +398,7 @@ describe("cached row identity across a correction-producing resize (delta 4)", (
       .reverse()
       .find(
         (e) =>
-          e !== anchor &&
-          e.getBoundingClientRect().bottom <= viewportTop + 1,
+          e !== anchor && e.getBoundingClientRect().bottom <= viewportTop + 1,
       ) as HTMLElement;
     openWitness();
     grown.style.height = `${grown.getBoundingClientRect().height + 180}px`;
@@ -435,9 +422,8 @@ describe("cached row identity across a correction-producing resize (delta 4)", (
     expect(reInvoked).toEqual([]);
 
     // OUTCOME: the anchor stayed put across the correction.
-    expect(Math.abs(relativeTop(viewport, anchor) - before)).toBeLessThanOrEqual(
-      SUBPIXEL,
-    );
+    expect(
+      Math.abs(relativeTop(viewport, anchor) - before),
+    ).toBeLessThanOrEqual(SUBPIXEL);
   });
-
 });

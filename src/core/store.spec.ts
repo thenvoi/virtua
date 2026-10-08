@@ -53,9 +53,8 @@ describe("item size estimator geometry compensation (FORK-CHANGES.md delta 5)", 
 
     // Index 1 grows from 30 to 50 (+20); everything from index 2 on shifts by
     // the same +20, so the anchor's own offset shifts by exactly +20 too.
-    store.$update(
-      ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
-      (index: number) => (index === 1 ? 50 : 30),
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
     );
     // The vendored copy parked this +20 in pendingJump until scroll-end under
     // its (now-retired) desktop-WebKit deferral; without the deferral the
@@ -168,9 +167,9 @@ describe("virtual store item remapping (FORK-CHANGES.md delta 6)", () => {
       [2, 30],
     ]);
 
-    expect(
-      store.$remapItems({ previousLength: 3, order: [2, 0, 1] }),
-    ).toBe(true);
+    expect(store.$remapItems({ previousLength: 3, order: [2, 0, 1] })).toBe(
+      true,
+    );
     expect(rawSizes(layout)).toEqual([30, 10, 20]);
     expect(store.$isUnmeasuredItem(0)).toBe(false);
   });
@@ -199,9 +198,9 @@ describe("virtual store item remapping (FORK-CHANGES.md delta 6)", () => {
     store.$update(ACTION_ITEMS_LENGTH_CHANGE, [4]);
     const before = rawSizes(layout);
 
-    expect(
-      store.$remapItems({ previousLength: 3, order: [0, 1, 2, -1] }),
-    ).toBe(false);
+    expect(store.$remapItems({ previousLength: 3, order: [0, 1, 2, -1] })).toBe(
+      false,
+    );
     expect(rawSizes(layout)).toEqual(before);
   });
 
@@ -325,9 +324,8 @@ describe("stale jump discard across a remap (FORK-CHANGES.md delta 6)", () => {
     store.$update(ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, 200);
     // Index 1 grows 30 -> 50 (+20) — deferred into pendingJump by the
     // frozen smooth-scroll range.
-    store.$update(
-      ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
-      (index: number) => (index === 1 ? 50 : 30),
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
     );
   };
 
@@ -358,9 +356,8 @@ describe("stale jump discard across a remap (FORK-CHANGES.md delta 6)", () => {
 
     // Index 1 grows 30 -> 50 (+20), applied immediately (no gesture in
     // progress) — the same write branch every idle correction takes.
-    store.$update(
-      ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
-      (index: number) => (index === 1 ? 50 : 30),
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
     );
 
     expect(
@@ -395,9 +392,8 @@ describe("stale jump discard across a remap (FORK-CHANGES.md delta 6)", () => {
     store._flushJump();
 
     // +20 applied immediately, same as the identity-remap test above.
-    store.$update(
-      ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
-      (index: number) => (index === 1 ? 50 : 30),
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
     );
 
     store.$update(ACTION_ITEMS_LENGTH_CHANGE, [7, false]);

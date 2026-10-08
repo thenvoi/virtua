@@ -200,7 +200,7 @@ describe("prepend committed between two scroll deliveries while scrolling toward
     // the older page commits in the gap between the two deliveries
     items = [...range(ADDED, (i) => `item-${i - ADDED}`), ...items];
     openWitness();
-openWitness();
+    openWitness();
     rerender(root, <List items={items} shift />);
     // React root renders commit asynchronously — the shift correction lands
     // with the commit, so the witness stays open until a NONZERO jump
@@ -217,9 +217,9 @@ openWitness();
     // keep their document positions, the anchor drifts by the full shift
     // (or unmounts) and this fails before the trajectory step can mask it.
     expect(anchor.isConnected).toBe(true);
-    expect(Math.abs(relativeTop(viewport, anchor) - afterFirst)).toBeLessThanOrEqual(
-      SUBPIXEL,
-    );
+    expect(
+      Math.abs(relativeTop(viewport, anchor) - afterFirst),
+    ).toBeLessThanOrEqual(SUBPIXEL);
 
     const second = onceScroll(viewport);
     viewport.scrollTop -= 100; // the gesture's next delivered scroll
@@ -298,16 +298,21 @@ describe("edge corrections use the absolute branch", () => {
     // to(0) <= 0 → absolute; the reader keeps row-2 at the same spot.
     expect(witness.writes).toContain("absolute");
     expect(witness.writes).not.toContain("relative");
-    expect(Math.abs(relativeTop(viewport, anchor) - before)).toBeLessThanOrEqual(
-      SUBPIXEL,
-    );
+    expect(
+      Math.abs(relativeTop(viewport, anchor) - before),
+    ).toBeLessThanOrEqual(SUBPIXEL);
   });
 
   it("absolute-end: rows above the viewport growing at the bottom dispatches from >= end", async () => {
     const handle = createRef<VirtualizerHandle>();
     const root = render(
       <div style={{ height: 300, overflowY: "auto" }}>
-        <Virtualizer ref={handle} data={range(20)} itemSize={100} keepMounted={[2]}>
+        <Virtualizer
+          ref={handle}
+          data={range(20)}
+          itemSize={100}
+          keepMounted={[2]}
+        >
           {(i) => (
             <div key={i} style={{ height: 100 }}>
               {i}
@@ -348,14 +353,17 @@ describe("edge corrections use the absolute branch", () => {
     // The same row, unMOVED by the growth — the outcome this case pins; the
     // distance-to-end check alone could pass by accident under suppression.
     expect(anchor.isConnected).toBe(true);
-    expect(Math.abs(relativeTop(viewport, anchor) - before)).toBeLessThanOrEqual(
-      SUBPIXEL,
-    );
+    expect(
+      Math.abs(relativeTop(viewport, anchor) - before),
+    ).toBeLessThanOrEqual(SUBPIXEL);
 
     // growing content above while the reader is at the end: the absolute
     // write re-anchors exactly at the grown end — not past it, not short.
     await expect
-      .poll(() => viewport.scrollHeight - (viewport.scrollTop + viewport.clientHeight))
+      .poll(
+        () =>
+          viewport.scrollHeight - (viewport.scrollTop + viewport.clientHeight),
+      )
       .toBeLessThanOrEqual(SUBPIXEL);
   });
 });

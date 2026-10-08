@@ -309,7 +309,10 @@ describe("itemSize estimator", () => {
   });
 
   it("reprices still-unmeasured rows from the first unmeasured index on a real swap, leaving measured rows alone", () => {
-    const layout = createListLayout(4, 16, [[20, UNCACHED, UNCACHED, UNCACHED], 16]);
+    const layout = createListLayout(4, 16, [
+      [20, UNCACHED, UNCACHED, UNCACHED],
+      16,
+    ]);
     layout.$setEstimator(() => 30);
     expect(layout.$getItemSize(1)).toBe(30);
     expect(layout.$getItemSize(2)).toBe(30);

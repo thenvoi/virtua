@@ -30,7 +30,11 @@ import {
   sort,
 } from "../core/index.js";
 import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
-import { getKey, refKey, type ItemElement as CachedRowElement } from "./utils.js";
+import {
+  getKey,
+  refKey,
+  type ItemElement as CachedRowElement,
+} from "./utils.js";
 import { useStatic } from "./useStatic.js";
 import { useLatestRef } from "./useLatestRef.js";
 import { ListItem } from "./ListItem.js";
@@ -268,8 +272,7 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
     // estimator. This also fixes `_scrollMode` timing for the shift-vs-anchor
     // compensation branch in the store, which only becomes SCROLL_BY_SHIFT
     // inside the length-change handler.
-    const itemSizeEstimator =
-      typeof itemSize === "function" ? itemSize : null;
+    const itemSizeEstimator = typeof itemSize === "function" ? itemSize : null;
     const oldItemsLength = store.$getItemsLength();
     if (shift || count < oldItemsLength) {
       if (count !== oldItemsLength) {
