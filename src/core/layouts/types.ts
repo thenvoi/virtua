@@ -34,4 +34,19 @@ export interface Layout {
    * @internal
    */
   $setEstimator?(estimator: ItemSizeEstimator | null): boolean;
+  /**
+   * The raw per-index sizes: measured values, or UNCACHED for rows not yet
+   * measured by ResizeObserver. Implemented only by layouts Band's identity
+   * remap can rebuild from; the store refuses the remap when absent.
+   *
+   * @internal
+   */
+  $remapSource?(): readonly number[];
+  /**
+   * Rebuild the raw size cache wholesale from a remapped array, discarding
+   * everything derived from the old index-to-row mapping.
+   *
+   * @internal
+   */
+  $replaceSizes?(sizes: readonly number[]): void;
 }

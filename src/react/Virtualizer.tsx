@@ -92,6 +92,21 @@ export interface VirtualizerHandle {
    * @param offset offset from current position
    */
   scrollBy(offset: number): void;
+  /**
+   * Rebuild measured item sizes from the previous identity order (fork delta 6).
+   *
+   * The caller supplies identity order only. Each new index points to its
+   * previous index or -1. Returns false when the store cannot prove the source
+   * is safe, including while automatic item-size estimation is active.
+   */
+  remapItems(args: {
+    previousLength: number;
+    order: readonly number[];
+  }): boolean;
+  /**
+   * Return whether an item has no measured size.
+   */
+  isUnmeasuredItem(index: number): boolean;
 }
 
 /**
@@ -388,6 +403,8 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
           scrollToIndex(driver, store, index, opts),
         scrollTo: (offset) => scrollTo(driver, offset),
         scrollBy: (offset) => scrollBy(driver, store, offset),
+        remapItems: store.$remapItems,
+        isUnmeasuredItem: store.$isUnmeasuredItem,
       };
     }, []);
 

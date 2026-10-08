@@ -1,4 +1,4 @@
-import { findIndex } from "./cache.js";
+import { UNCACHED, findIndex } from "./cache.js";
 import { isIOSWebKit } from "./environment.js";
 import type { ItemSizeEstimator, Layout } from "./layouts/types.js";
 import type { ItemResize, ItemsRange } from "./types.js";
@@ -98,9 +98,25 @@ export type VirtualStore = {
   $getViewportSize(): number;
   $getStartSpacerSize(): number;
   $getTotalSize(): number;
+  /**
+   * Rebuild the measured-size cache from the previous identity order (fork
+   * delta 6). Returns false when the store cannot prove the source is safe,
+   * including while automatic item-size estimation is active or the layout
+   * cannot remap its sizes.
+   */
+  $remapItems(args: {
+    previousLength: number;
+    order: readonly number[];
+  }): boolean;
   _flushJump(): [number, boolean];
   $subscribe(target: number, cb: Subscriber): () => void;
   $update(...action: Actions): void;
+};
+
+type RetainedLengthChange = {
+  fromLength: number;
+  toLength: number;
+  sizes: readonly number[];
 };
 
 /**
@@ -118,6 +134,8 @@ export const createVirtualStore = (
     $isEstimating: isEstimating,
     $resize: resize,
     $setEstimator: setEstimator,
+    $remapSource: getSizes,
+    $replaceSizes: replaceSizes,
   }: Layout,
   ssrCount: number = 0,
 ): VirtualStore => {
@@ -134,6 +152,7 @@ export const createVirtualStore = (
   let _frozenRange: ItemsRange | null = NULL;
   let _prevRange: ItemsRange = [0, isSSR ? max(ssrCount - 1, 0) : -1];
   let _isViewportMeasured = false;
+  let retainedLengthChange: RetainedLengthChange | null = null;
 
   const subscribers = new Set<[number, Subscriber]>();
   const getRelativeScrollOffset = () => scrollOffset - startSpacerSize;
@@ -183,6 +202,92 @@ export const createVirtualStore = (
         jump += j;
       }
     }
+  };
+
+  // Fork delta 6: rebuild the size cache from the caller's previous identity
+  // order. Each new index points at its previous index or -1.
+  const remapItems = ({
+    previousLength,
+    order,
+  }: {
+    previousLength: number;
+    order: readonly number[];
+  }): boolean => {
+    if (
+      !replaceSizes ||
+      !getSizes ||
+      isEstimating() ||
+      order.length !== getLength()
+    ) {
+      return false;
+    }
+
+    const source =
+      previousLength === getLength()
+        ? getSizes()
+        : retainedLengthChange &&
+            retainedLengthChange.fromLength === previousLength &&
+            retainedLengthChange.toLength === getLength() &&
+            retainedLengthChange.sizes.length === previousLength
+          ? retainedLengthChange.sizes
+          : undefined;
+    if (!source) return false;
+
+    const sizes = new Array<number>(getLength());
+    for (let index = 0; index < order.length; index++) {
+      const sourceIndex = order[index]!;
+      if (
+        !Number.isInteger(sourceIndex) ||
+        sourceIndex < -1 ||
+        sourceIndex >= source.length
+      ) {
+        return false;
+      }
+      const size = sourceIndex === -1 ? UNCACHED : source[sourceIndex]!;
+      if (size !== UNCACHED && !Number.isFinite(size)) return false;
+      sizes[index] = size;
+    }
+
+    replaceSizes(sizes);
+    if (previousLength !== getLength()) {
+      retainedLengthChange = null;
+    }
+    // A genuine reorder/filter — at a stable length, or landing mid-way
+    // through a length change it does not itself belong to — changes which
+    // row a given index refers to. Any still-parked scroll-position
+    // correction computed against the OLD mapping — most commonly an
+    // item-size estimator swap deferred through an in-progress gesture, see
+    // ACTION_ITEM_SIZE_ESTIMATOR_CHANGE — is now stale and must not be
+    // released later at ACTION_SCROLL_END; discard it here. A length
+    // difference ALONE does not prove the correction belongs to this remap:
+    // source-authority recovery/reload changes count too, and a non-shift
+    // growth (ACTION_ITEMS_LENGTH_CHANGE's isShift false) never calls
+    // applyJump at all, so any jump/pendingJump present when ITS remap runs
+    // is necessarily a leftover from something else entirely. Two cases stay
+    // safe to preserve: completing an in-flight ACTION_ITEMS_LENGTH_CHANGE
+    // SHIFT/growth transaction — detected by _scrollMode still being
+    // SCROLL_BY_SHIFT, which only that transaction sets and only a remap or
+    // scroll-end ever clears — and a same-length identity permutation
+    // (order[i] === i for every i) that moves no row at all, so replaceSizes
+    // just wrote back the identical values.
+    const isCompletingShiftGrowth =
+      previousLength !== getLength() && _scrollMode === SCROLL_BY_SHIFT;
+    const isIdentityReorder =
+      !isCompletingShiftGrowth &&
+      previousLength === getLength() &&
+      order.every((sourceIndex, index) => sourceIndex === index);
+    if (!isCompletingShiftGrowth && !isIdentityReorder) {
+      jump = 0;
+      pendingJump = 0;
+    }
+    _flushedJump = 0;
+    _frozenRange = NULL;
+    _scrollMode = SCROLL_BY_NATIVE;
+    stateVersion = (stateVersion & MAX_INT_32) + 1;
+    subscribers.forEach(([target, cb]) => {
+      if (target & UPDATE_VIRTUAL_STATE) cb(false);
+    });
+    return true;
   };
 
   return {
@@ -241,6 +346,7 @@ export const createVirtualStore = (
     $getViewportSize: () => viewportSize,
     $getStartSpacerSize: () => startSpacerSize,
     $getTotalSize: getTotalSize,
+    $remapItems: remapItems,
     _flushJump: () => {
       _flushedJump = jump;
       jump = 0;
@@ -366,6 +472,17 @@ export const createVirtualStore = (
           break;
         }
         case ACTION_ITEMS_LENGTH_CHANGE: {
+          // A length change ends the previous window: remember its exact
+          // retained sizes so a remap that completes this transaction can
+          // rebuild from them (fork delta 6).
+          retainedLengthChange =
+            payload[0] === getLength()
+              ? null
+              : {
+                  fromLength: getLength(),
+                  toLength: payload[0],
+                  sizes: getSizes ? getSizes().slice() : [],
+                };
           if (payload[1]) {
             applyJump(setLength(payload[0], true));
             _scrollMode = SCROLL_BY_SHIFT;

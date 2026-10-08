@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { createListLayout } from "./layouts/list.js";
+import { UNCACHED } from "./cache.js";
+import { createListLayout, type ListLayout } from "./layouts/list.js";
 import {
+  ACTION_BEFORE_MANUAL_SMOOTH_SCROLL,
   ACTION_ITEM_RESIZE,
   ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
   ACTION_ITEMS_LENGTH_CHANGE,
+  ACTION_MANUAL_SCROLL,
   ACTION_SCROLL,
+  ACTION_SCROLL_END,
   ACTION_VIEWPORT_RESIZE,
   createVirtualStore,
+  UPDATE_VIRTUAL_STATE,
+  type VirtualStore,
 } from "./store.js";
 
 // Ported from Band's vendored core/store.test.ts (deltas 5 and 6). Two
@@ -144,5 +150,260 @@ describe("item size estimator dispatch order across a prepend (delta 5)", () => 
     expect(store.$getItemSize(0)).toBe(999);
     expect(store.$getItemSize(1)).toBe(100);
     expect(store.$getItemSize(2)).toBe(110);
+  });
+});
+
+// Raw-size snapshot through the layout's remap seam, for the assertions below.
+function rawSizes(layout: ListLayout): number[] {
+  return [...layout.$remapSource()];
+}
+
+describe("virtual store item remapping (FORK-CHANGES.md delta 6)", () => {
+  it("uses current raw sizes for same-length identity changes", () => {
+    const layout = createListLayout(3, 16);
+    const store = createVirtualStore(layout);
+    store.$update(ACTION_ITEM_RESIZE, [
+      [0, 10],
+      [1, 20],
+      [2, 30],
+    ]);
+
+    expect(
+      store.$remapItems({ previousLength: 3, order: [2, 0, 1] }),
+    ).toBe(true);
+    expect(rawSizes(layout)).toEqual([30, 10, 20]);
+    expect(store.$isUnmeasuredItem(0)).toBe(false);
+  });
+
+  it("uses the exact retained raw window for a length change", () => {
+    const layout = createListLayout(3, 16);
+    const store = createVirtualStore(layout);
+    store.$update(ACTION_ITEM_RESIZE, [
+      [0, 10],
+      [1, 20],
+      [2, 30],
+    ]);
+    store.$update(ACTION_ITEMS_LENGTH_CHANGE, [5]);
+
+    expect(
+      store.$remapItems({ previousLength: 3, order: [2, -1, 0, 1, -1] }),
+    ).toBe(true);
+    expect(rawSizes(layout)).toEqual([30, UNCACHED, 10, 20, UNCACHED]);
+  });
+
+  it("rejects a superseded retained window without mutating sizes", () => {
+    const layout = createListLayout(3, 16);
+    const store = createVirtualStore(layout);
+    store.$update(ACTION_ITEM_RESIZE, [[0, 10]]);
+    store.$update(ACTION_ITEMS_LENGTH_CHANGE, [5]);
+    store.$update(ACTION_ITEMS_LENGTH_CHANGE, [4]);
+    const before = rawSizes(layout);
+
+    expect(
+      store.$remapItems({ previousLength: 3, order: [0, 1, 2, -1] }),
+    ).toBe(false);
+    expect(rawSizes(layout)).toEqual(before);
+  });
+
+  it("rejects invalid order entries without mutating sizes", () => {
+    const layout = createListLayout(3, 16);
+    const store = createVirtualStore(layout);
+    store.$update(ACTION_ITEM_RESIZE, [[0, 10]]);
+    const before = rawSizes(layout);
+
+    expect(store.$remapItems({ previousLength: 3, order: [0, 3, 1] })).toBe(
+      false,
+    );
+    expect(rawSizes(layout)).toEqual(before);
+  });
+
+  it("rejects remapping while automatic estimation is active", () => {
+    const layout = createListLayout(3);
+    const store = createVirtualStore(layout);
+    const before = rawSizes(layout);
+
+    expect(store.$remapItems({ previousLength: 3, order: [2, 0, 1] })).toBe(
+      false,
+    );
+    expect(rawSizes(layout)).toEqual(before);
+  });
+
+  it("rejects non-finite source sizes without mutating sizes", () => {
+    const layout = createListLayout(2, 16);
+    const store = createVirtualStore(layout);
+    store.$update(ACTION_ITEM_RESIZE, [[0, Number.NaN]]);
+    const before = rawSizes(layout);
+
+    expect(store.$remapItems({ previousLength: 2, order: [0, 1] })).toBe(false);
+    expect(rawSizes(layout)).toEqual(before);
+  });
+
+  it("notifies virtual state subscribers asynchronously after remapping", () => {
+    const store = createVirtualStore(createListLayout(2, 16));
+    const syncValues: (boolean | undefined)[] = [];
+    store.$subscribe(UPDATE_VIRTUAL_STATE, (sync) => syncValues.push(sync));
+
+    expect(store.$remapItems({ previousLength: 2, order: [1, 0] })).toBe(true);
+    expect(syncValues).toEqual([false]);
+  });
+
+  it("bumps the state version on a successful remap, so version-gated consumers observe it", () => {
+    const store = createVirtualStore(createListLayout(2, 16));
+    const before = store.$getStateVersion();
+
+    expect(store.$remapItems({ previousLength: 2, order: [1, 0] })).toBe(true);
+    expect(store.$getStateVersion()).not.toBe(before);
+  });
+
+  it("preserves jump while clearing shift mode after remapping", () => {
+    const store = createVirtualStore(createListLayout(3, 16));
+    store.$update(ACTION_ITEMS_LENGTH_CHANGE, [5, true]);
+
+    expect(
+      store.$remapItems({ previousLength: 3, order: [2, -1, 0, 1, -1] }),
+    ).toBe(true);
+    expect(store._flushJump()).toEqual([32, false]);
+  });
+
+  it("clears a previously flushed shift jump before remapping", () => {
+    const store = createVirtualStore(createListLayout(3, 16));
+    store.$update(ACTION_ITEMS_LENGTH_CHANGE, [5, true]);
+
+    expect(store._flushJump()).toEqual([32, true]);
+    expect(
+      store.$remapItems({ previousLength: 3, order: [2, -1, 0, 1, -1] }),
+    ).toBe(true);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+
+  it("preserves a pending jump while clearing the frozen range", () => {
+    const store = createVirtualStore(createListLayout(4, 16));
+    store.$update(ACTION_ITEM_RESIZE, [
+      [0, 10],
+      [1, 20],
+      [2, 30],
+      [3, 40],
+    ]);
+    store.$update(ACTION_VIEWPORT_RESIZE, 20);
+    store.$update(ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, 60);
+    expect(store.$getRange(0)[1]).toBe(3);
+
+    store.$update(ACTION_MANUAL_SCROLL);
+    store.$update(ACTION_ITEM_RESIZE, [[0, 15]]);
+    // Identity permutation: the parked smooth-scroll correction stays (delta 6
+    // preserves it), but the frozen range clears.
+    expect(store.$remapItems({ previousLength: 4, order: [0, 1, 2, 3] })).toBe(
+      true,
+    );
+    expect(store.$getRange(0)[1]).toBeLessThan(3);
+
+    // The vendored copy released the parked jump at the start edge mid-scroll
+    // (its retired delta 3); upstream releases the deferral at scroll end,
+    // with the direction made non-idle by a delivered scroll event — the
+    // preserved pendingJump arrives there unchanged.
+    store.$update(ACTION_SCROLL, 1);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([5, false]);
+  });
+});
+
+describe("stale jump discard across a remap (FORK-CHANGES.md delta 6)", () => {
+  // A genuine reorder or filter rebuilds sizes for a DIFFERENT row at each
+  // index. A jump or pendingJump parked by an EARLIER, unrelated estimator
+  // swap describes a correction for the OLD mapping and must not survive.
+  // The vendored copy deferred through its desktop-WebKit guard (retired
+  // deltas 1-3); here the deferral role is filled by upstream's own
+  // smooth-scroll path: ACTION_MANUAL_SCROLL + ACTION_BEFORE_MANUAL_SMOOTH_SCROLL
+  // park applyJump results in pendingJump until scroll end.
+  const parkPendingJump = (store: VirtualStore) => {
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5); // prime estimates for the whole range
+    store._flushJump();
+    store.$update(ACTION_MANUAL_SCROLL);
+    store.$update(ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, 200);
+    // Index 1 grows 30 -> 50 (+20) — deferred into pendingJump by the
+    // frozen smooth-scroll range.
+    store.$update(
+      ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
+      (index: number) => (index === 1 ? 50 : 30),
+    );
+  };
+
+  it("discards a deferred estimator-swap pendingJump across a non-identity remap, so scroll-end releases nothing", () => {
+    const store = createVirtualStore(createListLayout(6, 16));
+    parkPendingJump(store);
+
+    // A genuine (non-identity) same-length reorder lands before the gesture
+    // ends — every index now refers to a different row than the pendingJump
+    // was computed against.
+    expect(
+      store.$remapItems({ previousLength: 6, order: [1, 0, 2, 3, 4, 5] }),
+    ).toBe(true);
+
+    // Ending the gesture must not release the obsolete pre-remap delta.
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+
+  it("discards an immediate (non-deferred) estimator-swap jump across a non-identity remap", () => {
+    const store = createVirtualStore(createListLayout(6, 16));
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_SCROLL_END);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5); // prime estimates for the whole range
+    store._flushJump();
+
+    // Index 1 grows 30 -> 50 (+20), applied immediately (no gesture in
+    // progress) — the same write branch every idle correction takes.
+    store.$update(
+      ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
+      (index: number) => (index === 1 ? 50 : 30),
+    );
+
+    expect(
+      store.$remapItems({ previousLength: 6, order: [1, 0, 2, 3, 4, 5] }),
+    ).toBe(true);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+
+  it("discards a deferred estimator-swap pendingJump across a non-shift length-changing remap", () => {
+    const store = createVirtualStore(createListLayout(6, 16));
+    parkPendingJump(store);
+
+    // A PLAIN (non-shift) growth to 7 rows never calls applyJump, so it
+    // leaves the parked +20 untouched — and never sets _scrollMode to
+    // SCROLL_BY_SHIFT, unlike a real prepend.
+    store.$update(ACTION_ITEMS_LENGTH_CHANGE, [7, false]);
+    expect(
+      store.$remapItems({ previousLength: 6, order: [0, 1, 2, 3, 4, 5, -1] }),
+    ).toBe(true);
+
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+
+  it("discards an immediate estimator-swap jump across a non-shift length-changing remap", () => {
+    const store = createVirtualStore(createListLayout(6, 16));
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_SCROLL_END);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5);
+    store._flushJump();
+
+    // +20 applied immediately, same as the identity-remap test above.
+    store.$update(
+      ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
+      (index: number) => (index === 1 ? 50 : 30),
+    );
+
+    store.$update(ACTION_ITEMS_LENGTH_CHANGE, [7, false]);
+    expect(
+      store.$remapItems({ previousLength: 6, order: [0, 1, 2, 3, 4, 5, -1] }),
+    ).toBe(true);
+    expect(store._flushJump()).toEqual([0, false]);
   });
 });

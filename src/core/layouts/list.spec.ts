@@ -379,3 +379,25 @@ describe("setLength pricing with an estimator", () => {
     expect(layout.$setLength(2)).toBe(-32);
   });
 });
+
+// Ported from Band's vendored core/cache.test.ts (delta 6's cache half): a
+// remap rebuilds sizes from an arbitrary reorder, so every cached estimate —
+// priced for an index whose row it no longer describes — must be gone.
+describe("replaceSizes (remap) discards estimates wholesale", () => {
+  it("forces every still-unmeasured index through the estimator again", () => {
+    const layout = createListLayout(3, 16);
+    const estimator = vi.fn(() => 42);
+    layout.$setEstimator(estimator);
+    layout.$getItemSize(0);
+    layout.$getItemSize(1);
+    expect(estimator).toHaveBeenCalledTimes(2);
+
+    layout.$replaceSizes([UNCACHED, UNCACHED, UNCACHED]);
+
+    expect(layout.$getItemSize(0)).toBe(42);
+    expect(layout.$getItemSize(1)).toBe(42);
+    expect(layout.$getItemSize(2)).toBe(42);
+    expect(estimator).toHaveBeenCalledTimes(5); // all three re-priced
+    expect(layout.$getItemOffset(2)).toBe(42 + 42);
+  });
+});
