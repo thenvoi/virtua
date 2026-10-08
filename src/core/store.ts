@@ -1,5 +1,5 @@
 import { UNCACHED, findIndex } from "./cache.js";
-import { isIOSWebKit } from "./environment.js";
+import { isIOSWebKit, isWebKit } from "./environment.js";
 import type { ItemSizeEstimator, Layout } from "./layouts/types.js";
 import type { ItemResize, ItemsRange } from "./types.js";
 import { abs, max, min, NULL } from "./utils.js";
@@ -40,6 +40,14 @@ export const ACTION_BEFORE_MANUAL_SMOOTH_SCROLL = 8;
 export const ACTION_RELAYOUT = 9;
 /** @internal */
 export const ACTION_ITEM_SIZE_ESTIMATOR_CHANGE = 10;
+/**
+ * Fork delta 1 seam: wheel/touch activity reported by the scroll observer.
+ * Desktop WebKit reverts position writes DURING a user gesture; #942's
+ * relative writes remain correct for programmatic scrolls, so the deferral
+ * is keyed on the gesture, not on scroll direction.
+ * @internal
+ */
+export const ACTION_USER_GESTURE = 11;
 
 type Actions =
   | [type: typeof ACTION_SCROLL, offset: number]
@@ -57,7 +65,8 @@ type Actions =
   | [
       type: typeof ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
       estimator: ItemSizeEstimator | null,
-    ];
+    ]
+  | [type: typeof ACTION_USER_GESTURE, active: boolean];
 
 /** @internal */
 export const UPDATE_VIRTUAL_STATE = 0b0001;
@@ -148,6 +157,10 @@ export const createVirtualStore = (
   let pendingJump = 0;
   let _flushedJump = 0;
   let _scrollDirection: ScrollDirection = SCROLL_IDLE;
+  // Fork delta 1 seam: set while a user scroll gesture (wheel/touch) is
+  // active; the desktop-WebKit deferral keys on this, not on direction —
+  // programmatic scrolls must keep #942's immediate relative writes.
+  let _userGestureActive = false;
   let _scrollMode: ScrollMode = SCROLL_BY_NATIVE;
   let _frozenRange: ItemsRange | null = NULL;
   let _prevRange: ItemsRange = [0, isSSR ? max(ssrCount - 1, 0) : -1];
@@ -190,9 +203,17 @@ export const createVirtualStore = (
 
   const applyJump = (j: number) => {
     if (j) {
-      if (
-        // In iOS WebKit browsers, updating scroll position will stop scrolling so it have to be deferred during scrolling.
+      const deferredByGesture =
+        // In iOS WebKit browsers, updating scroll position will stop scrolling
+        // so it have to be deferred during scrolling.
         (isIOSWebKit() && _scrollDirection !== SCROLL_IDLE) ||
+        // Desktop WebKit (WKWebView) reverts a scroll position written during
+        // a USER gesture; on 0.53.3 the deferral keys on the observer's
+        // wheel/touch seam rather than direction, so programmatic scrolls
+        // keep #942's relative writes (FORK-CHANGES.md delta 1).
+        (isWebKit() && _userGestureActive);
+      if (
+        deferredByGesture ||
         // Before imperative smooth scrolling, we measure all items which may be visible during scrolling.
         // However, especially in Firefox, there are rare cases where items resize while scrolling, which can stop smooth scrolling.
         (_frozenRange && _scrollMode === SCROLL_BY_MANUAL_SCROLL)
@@ -433,6 +454,7 @@ export const createVirtualStore = (
           _scrollDirection = SCROLL_IDLE;
           _scrollMode = SCROLL_BY_NATIVE;
           _frozenRange = NULL;
+          _userGestureActive = false;
           break;
         }
         case ACTION_ITEM_RESIZE: {
@@ -493,6 +515,10 @@ export const createVirtualStore = (
             // https://github.com/inokawa/virtua/issues/557
             mutated = UPDATE_VIRTUAL_STATE;
           }
+          break;
+        }
+        case ACTION_USER_GESTURE: {
+          _userGestureActive = payload;
           break;
         }
         case ACTION_START_OFFSET_CHANGE: {

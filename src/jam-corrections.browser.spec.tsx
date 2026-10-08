@@ -200,7 +200,6 @@ describe("prepend committed between two scroll deliveries while scrolling toward
     // the older page commits in the gap between the two deliveries
     items = [...range(ADDED, (i) => `item-${i - ADDED}`), ...items];
     openWitness();
-    openWitness();
     rerender(root, <List items={items} shift />);
     // React root renders commit asynchronously — the shift correction lands
     // with the commit, so the witness stays open until a NONZERO jump

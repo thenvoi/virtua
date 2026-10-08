@@ -8,6 +8,7 @@ import {
   type VirtualStore,
   ACTION_SCROLL_END,
   ACTION_START_OFFSET_CHANGE,
+  ACTION_USER_GESTURE,
   ACTION_MANUAL_SCROLL,
   ACTION_BEFORE_MANUAL_SMOOTH_SCROLL,
   UPDATE_SIZE_EVENT,
@@ -103,6 +104,7 @@ export const createScrollObserver = (
 
     justTouchEnded = false;
 
+    store.$update(ACTION_USER_GESTURE, false);
     store.$update(ACTION_SCROLL_END);
   };
   const scheduleScrollEnd = () => {
@@ -128,6 +130,13 @@ export const createScrollObserver = (
   // Infer scroll state also from wheel events
   // Sometimes scroll events do not fire when frame dropped even if the visual have been already scrolled
   const onWheel = ((e: WheelEvent) => {
+    // Fork delta 1 seam: report user-gesture activity to the store before
+    // any inference filtering. A wheel on this viewport during scrolling is
+    // exactly the moment WKWebView reverts written positions; ctrlKey is
+    // the pinch-zoom gesture, which does not scroll.
+    if (!e.ctrlKey && store.$isScrolling()) {
+      store.$update(ACTION_USER_GESTURE, true);
+    }
     if (
       wheeling ||
       // Scroll start should be detected with scroll event
@@ -154,10 +163,16 @@ export const createScrollObserver = (
 
   const onTouchStart = () => {
     touching = true;
+    store.$update(ACTION_USER_GESTURE, true);
     justTouchEnded = stillMomentumScrolling = false;
   };
   const onTouchEnd = () => {
     touching = false;
+    // Post-lift momentum on iOS is covered by the direction branch of the
+    // deferral; desktop engines get their momentum from wheel events, which
+    // keep re-reporting the gesture. Clear here so a lifted touch cannot
+    // leave the seam stuck active.
+    store.$update(ACTION_USER_GESTURE, false);
     if (isIOSWebKit()) {
       justTouchEnded = true;
     }

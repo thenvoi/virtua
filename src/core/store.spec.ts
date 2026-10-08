@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { UNCACHED } from "./cache.js";
 import { createListLayout, type ListLayout } from "./layouts/list.js";
 import {
@@ -9,6 +9,7 @@ import {
   ACTION_MANUAL_SCROLL,
   ACTION_SCROLL,
   ACTION_SCROLL_END,
+  ACTION_USER_GESTURE,
   ACTION_VIEWPORT_RESIZE,
   createVirtualStore,
   UPDATE_VIRTUAL_STATE,
@@ -18,9 +19,20 @@ import {
 // Ported from Band's vendored core/store.test.ts (deltas 5 and 6). Two
 // adaptations for the fork: the 0.53.3 store takes a Layout instead of a
 // (length, itemSize) pair, and the vendored WebKit mid-gesture deferral
-// (deltas 1–3) is retired here — corrections the vendored copy had to park
-// during a gesture are written immediately, exactly as upstream writes them
-// on every non-iOS browser. The stale-jump rules of delta 6 are unchanged.
+// (deltas 1–3, re-added by the F7 fallback in v0.53.3-jam.2) does not fire
+// in these tests — vitest's jsdom user agent carries a Chrome token, which
+// isWebKit() excludes by design — so corrections are written immediately
+// here exactly as in a Chromium tab. The WebKit branch is guarded in the
+// deferral block below and adjudicated by the browser suites (P7a) on a
+// real WebKit.
+const webkitFlag = vi.hoisted(() => ({ value: false }));
+vi.mock("./environment.js", () => ({
+  isIOSWebKit: () => false,
+  isWebKit: () => webkitFlag.value,
+}));
+beforeEach(() => {
+  webkitFlag.value = false;
+});
 
 const storeWith = (length: number, itemSize?: number) =>
   createVirtualStore(createListLayout(length, itemSize));
@@ -56,10 +68,10 @@ describe("item size estimator geometry compensation (FORK-CHANGES.md delta 5)", 
     store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
       index === 1 ? 50 : 30,
     );
-    // The vendored copy parked this +20 in pendingJump until scroll-end under
-    // its (now-retired) desktop-WebKit deferral; without the deferral the
-    // correction is written immediately, like every upstream correction on
-    // non-iOS browsers.
+    // The unit environment classifies as Chromium (see the header note), so
+    // the correction is written immediately, like every upstream correction
+    // outside a WebKit gesture; the parked variant is the deferral block's
+    // first test.
     expect(store._flushJump()).toEqual([20, false]);
   });
 
@@ -296,10 +308,9 @@ describe("virtual store item remapping (FORK-CHANGES.md delta 6)", () => {
     );
     expect(store.$getRange(0)[1]).toBeLessThan(3);
 
-    // The vendored copy released the parked jump at the start edge mid-scroll
-    // (its retired delta 3); upstream releases the deferral at scroll end,
-    // with the direction made non-idle by a delivered scroll event — the
-    // preserved pendingJump arrives there unchanged.
+    // A delivered scroll at the start edge releases the backlog mid-gesture
+    // (delta 3); scroll end (upstream's release) then finds nothing left —
+    // the preserved pendingJump arrives to the reader unchanged either way.
     store.$update(ACTION_SCROLL, 1);
     store.$update(ACTION_SCROLL_END);
     expect(store._flushJump()).toEqual([5, false]);
@@ -310,10 +321,11 @@ describe("stale jump discard across a remap (FORK-CHANGES.md delta 6)", () => {
   // A genuine reorder or filter rebuilds sizes for a DIFFERENT row at each
   // index. A jump or pendingJump parked by an EARLIER, unrelated estimator
   // swap describes a correction for the OLD mapping and must not survive.
-  // The vendored copy deferred through its desktop-WebKit guard (retired
-  // deltas 1-3); here the deferral role is filled by upstream's own
-  // smooth-scroll path: ACTION_MANUAL_SCROLL + ACTION_BEFORE_MANUAL_SMOOTH_SCROLL
-  // park applyJump results in pendingJump until scroll end.
+  // The vendored copy deferred through its desktop-WebKit guard; here the
+  // deferral role is filled by upstream's own smooth-scroll path:
+  // ACTION_MANUAL_SCROLL + ACTION_BEFORE_MANUAL_SMOOTH_SCROLL park applyJump
+  // results in pendingJump until scroll end (the engine flags are mocked off
+  // outside the deferral block below, so no gesture deferral fires here).
   const parkPendingJump = (store: VirtualStore) => {
     store.$update(ACTION_VIEWPORT_RESIZE, 50);
     store.$update(ACTION_SCROLL, 200);
@@ -401,5 +413,98 @@ describe("stale jump discard across a remap (FORK-CHANGES.md delta 6)", () => {
       store.$remapItems({ previousLength: 6, order: [0, 1, 2, 3, 4, 5, -1] }),
     ).toBe(true);
     expect(store._flushJump()).toEqual([0, false]);
+  });
+});
+
+describe("WebKit mid-gesture deferral (FORK-CHANGES.md deltas 1–3)", () => {
+  // The engine flags are mocked here and the deferral tests drive the
+  // observer's gesture seam (ACTION_USER_GESTURE) explicitly; the delta 5/6
+  // blocks above run with both off, matching vitest's Chromium-classified
+  // jsdom UA (it carries a Chrome token, which isWebKit() excludes) doing
+  // programmatic scrolls.
+
+  it("parks a correction through an active gesture when the engine classifies as WebKit (delta 1)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    // Prime the estimator OUTSIDE the gesture so its geometry delta (+70,
+    // which only delta 2's cap would apply mid-gesture) cannot pollute the
+    // parked value asserted below.
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5); // prime estimates; anchor resolves at index 5
+    store._flushJump();
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_USER_GESTURE, true);
+    // With a user gesture active on a WebKit-classified engine, the +20
+    // must park (delta 1's seam; without the gesture flag it writes through
+    // — see the next test).
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
+    );
+    expect(store._flushJump()).toEqual([0, false]);
+
+    // Gesture end releases the parked correction unchanged.
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([20, false]);
+  });
+
+  it("keeps #942's immediate writes for programmatic scrolls on a WebKit-classified engine (delta 1 seam)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5);
+    store._flushJump();
+    // A delivered scroll WITHOUT the observer's gesture flag — what
+    // scrollBy/scrollTo produce, as in upstream's compensation suites: the
+    // deferral must not fire; WKWebView only reverts USER-gesture writes.
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
+    );
+    expect(store._flushJump()).toEqual([20, false]);
+  });
+
+  it("classifies engines by user agent: WebKit true; Chrome, Edge, and Firefox false (delta 1)", async () => {
+    // isWebKit memoizes per module instance, so each UA gets a fresh import.
+    const cases: [string, boolean][] = [
+      [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        true,
+      ],
+      [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        false,
+      ],
+      [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0",
+        false,
+      ],
+      [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+        false,
+      ],
+    ];
+    const descriptor = Object.getOwnPropertyDescriptor(
+      navigator,
+      "userAgent",
+    ) ?? { configurable: true, get: () => "" };
+    for (const [ua, expected] of cases) {
+      vi.resetModules();
+      Object.defineProperty(navigator, "userAgent", {
+        value: ua,
+        configurable: true,
+      });
+      try {
+        const env =
+          await vi.importActual<typeof import("./environment.js")>(
+            "./environment.js",
+          );
+        expect([ua, env.isWebKit()]).toEqual([ua, expected]);
+      } finally {
+        Object.defineProperty(navigator, "userAgent", descriptor);
+      }
+    }
+    vi.resetModules();
   });
 });
