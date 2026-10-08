@@ -1,0 +1,117 @@
+# Keeps Band's fork deltas from going stale (see FORK-CHANGES.md).
+#
+# thenvoi/tjam consumes this fork rev-pinned through a release tarball based on
+# one upstream version tag. Taking an upgrade in tjam therefore needs the
+# deltas rebased onto the matching newer tag FIRST — this workflow pre-stages
+# that: weekly (and on demand) it fetches upstream, finds the newest semver
+# tag, replays this branch's fork-only commits onto it as `jam-<X.Y.Z>`, and
+# runs the full gate (types, unit suites, browser suites) there. A clean run
+# means the upgrade branch is ready before anyone needs it; a red run means
+# upstream drifted under a delta and a human must resolve it NOW, not
+# mid-upgrade.
+#
+# Notes:
+# - This file lives on the fork's DEFAULT branch (jam-<ver>), so the schedule
+#   is honored; GitHub disables upstream cron workflows in forks.
+# - The fork-only commits are derived, not stored: every commit on this branch
+#   that is in no upstream ref IS the delta + automation set, so the replay
+#   can't drift from the branch's reality.
+name: jam-rebase-patch
+
+on:
+  schedule:
+    - cron: "23 6 * * 1" # weekly, Monday 06:23 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest # same class upstream's check.yml/e2e use
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+          cache: "npm"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/inokawa/virtua.git
+          git fetch upstream --tags --quiet
+
+      - name: Plan (newest semver tag, fork-only commits, target branch)
+        id: plan
+        run: |
+          set -euo pipefail
+          tag=$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          [ -n "$tag" ] || { echo "no upstream semver tags found" >&2; exit 1; }
+          branch="jam-$tag"
+          # The fork-only set = commits on this branch that exist in no upstream ref.
+          patches=$(git rev-list --reverse HEAD --not --remotes=upstream)
+          [ -n "$patches" ] || { echo "no fork-only commits found on $(git branch --show-current)" >&2; exit 1; }
+          {
+            echo "tag=$tag"
+            echo "branch=$branch"
+            echo "patches<<EOF"
+            echo "$patches"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$branch already exists — nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replay the deltas onto the tag
+        if: steps.plan.outputs.exists == 'false'
+        env:
+          # Env, not inline ${{ }} interpolation: the list is multiline, and
+          # splicing it into the script would turn every SHA after the first
+          # into a stray shell command (whose failure an `if` condition
+          # silently swallows).
+          PATCHES: ${{ steps.plan.outputs.patches }}
+        run: |
+          set -euo pipefail
+          git config user.name "jam-fork-bot"
+          git config user.email "dev@thenvoi.com"
+          git checkout -b "${{ steps.plan.outputs.branch }}" "${{ steps.plan.outputs.tag }}"
+          while IFS= read -r sha; do
+            [ -z "$sha" ] && continue
+            if ! git cherry-pick "$sha"; then
+              echo "::error::$sha no longer applies onto ${{ steps.plan.outputs.tag }} — upstream drifted; rebase by hand and push ${{ steps.plan.outputs.branch }}"
+              exit 1
+            fi
+          done <<< "$PATCHES"
+
+      - name: Install
+        if: steps.plan.outputs.exists == 'false'
+        run: npm ci
+
+      - name: Gate the replay
+        if: steps.plan.outputs.exists == 'false'
+        run: |
+          npx playwright install --with-deps
+          npm run tsc
+          npm test
+          # --retry=2 matches upstream check.yml's e2e browser step; the
+          # 3-browser matrix flakes on runner timing under parallel load.
+          npm run test:browser -- --retry=2
+
+      - name: Push the pre-staged branch
+        if: steps.plan.outputs.exists == 'false'
+        run: |
+          git push origin "${{ steps.plan.outputs.branch }}"
+          {
+            echo "## jam-rebase-patch"
+            echo "Pre-staged \`${{ steps.plan.outputs.branch }}\` at $(git rev-parse --short HEAD) — full gate green."
+            echo ""
+            echo "To upgrade tjam: cut \`v${{ steps.plan.outputs.tag }}-jam.1\` on this branch"
+            echo "(jam-release runs the same gate and publishes the tarball), then bump the"
+            echo "pin and inventory."
+          } >> "$GITHUB_STEP_SUMMARY"
