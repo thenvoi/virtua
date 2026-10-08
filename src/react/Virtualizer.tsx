@@ -12,6 +12,7 @@ import {
 import {
   UPDATE_SCROLL_EVENT,
   ACTION_ITEMS_LENGTH_CHANGE,
+  ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
   createVirtualStore,
   createListLayout,
   UPDATE_VIRTUAL_STATE,
@@ -116,9 +117,16 @@ export interface VirtualizerProps<T = unknown> {
    * Item size hint for unmeasured items in pixels. It will help to reduce scroll jump when items are measured if used properly.
    *
    * - If not set, initial item sizes will be automatically estimated from measured sizes. This is recommended for most cases.
-   * - If set, you can opt out estimation and use the value as initial item size.
+   * - If set to a number, you can opt out estimation and use the value as initial item size.
+   * - If set to a function, it is called with a raw mounted index (not a caller
+   *   identity/key) to price each still-unmeasured row individually. Must be
+   *   cheap/O(1) — it can run many times synchronously (offset walks, binary
+   *   search over a large unmeasured range). A non-finite or non-positive
+   *   result falls back to this store's own configured/default size, not any
+   *   caller-specific floor — callers needing a floor/ceiling must clamp
+   *   inside their own function. Fork delta 5, not upstream virtua.
    */
-  itemSize?: number;
+  itemSize?: number | ((index: number) => number);
   /**
    * Set true only when items are added to or removed from the start of the list, such as when older items are loaded in reverse infinite scrolling. In that case, the scroll position is maintained from the end of the list instead of the start.
    *
@@ -232,9 +240,32 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
       ];
     });
 
-    // The elements length and cached items length are different just after element is added/removed.
-    if (count !== store.$getItemsLength()) {
-      store.$update(ACTION_ITEMS_LENGTH_CHANGE, [count, shift]);
+    // Fork delta 5: keep the installed per-index estimator in sync with the
+    // prop. Ordering matters when both the estimator and the count change
+    // together (e.g. a full content reload or a prepend). A shift (prepend)
+    // moves every surviving old index to a new position — the incoming
+    // estimator's closure is already built against the POST-shift data array,
+    // so swapping before the shift would recompute/pin estimates against the
+    // wrong identities (new callback, old cache index space). A shrink must
+    // price removed rows with whichever estimator priced them originally.
+    // Both cases dispatch the length change first, then swap. Only a plain
+    // (non-shift) growth swaps first, so new indices see the incoming
+    // estimator. This also fixes `_scrollMode` timing for the shift-vs-anchor
+    // compensation branch in the store, which only becomes SCROLL_BY_SHIFT
+    // inside the length-change handler.
+    const itemSizeEstimator =
+      typeof itemSize === "function" ? itemSize : null;
+    const oldItemsLength = store.$getItemsLength();
+    if (shift || count < oldItemsLength) {
+      if (count !== oldItemsLength) {
+        store.$update(ACTION_ITEMS_LENGTH_CHANGE, [count, shift]);
+      }
+      store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, itemSizeEstimator);
+    } else {
+      store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, itemSizeEstimator);
+      if (count !== oldItemsLength) {
+        store.$update(ACTION_ITEMS_LENGTH_CHANGE, [count, shift]);
+      }
     }
     if (startMargin !== store.$getStartSpacerSize()) {
       store.$update(ACTION_START_OFFSET_CHANGE, startMargin);

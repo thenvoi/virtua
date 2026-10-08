@@ -1,5 +1,6 @@
+import { findIndex } from "./cache.js";
 import { isIOSWebKit } from "./environment.js";
-import type { Layout } from "./layouts/types.js";
+import type { ItemSizeEstimator, Layout } from "./layouts/types.js";
 import type { ItemResize, ItemsRange } from "./types.js";
 import { abs, max, min, NULL } from "./utils.js";
 
@@ -37,6 +38,8 @@ export const ACTION_MANUAL_SCROLL = 7;
 export const ACTION_BEFORE_MANUAL_SMOOTH_SCROLL = 8;
 /** @internal */
 export const ACTION_RELAYOUT = 9;
+/** @internal */
+export const ACTION_ITEM_SIZE_ESTIMATOR_CHANGE = 10;
 
 type Actions =
   | [type: typeof ACTION_SCROLL, offset: number]
@@ -50,7 +53,11 @@ type Actions =
   | [type: typeof ACTION_START_OFFSET_CHANGE, offset: number]
   | [type: typeof ACTION_MANUAL_SCROLL, dummy?: void]
   | [type: typeof ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, offset: number]
-  | [type: typeof ACTION_RELAYOUT, jump: number | undefined];
+  | [type: typeof ACTION_RELAYOUT, jump: number | undefined]
+  | [
+      type: typeof ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
+      estimator: ItemSizeEstimator | null,
+    ];
 
 /** @internal */
 export const UPDATE_VIRTUAL_STATE = 0b0001;
@@ -110,6 +117,7 @@ export const createVirtualStore = (
     $setLength: setLength,
     $isEstimating: isEstimating,
     $resize: resize,
+    $setEstimator: setEstimator,
   }: Layout,
   ssrCount: number = 0,
 ): VirtualStore => {
@@ -383,6 +391,34 @@ export const createVirtualStore = (
           if (payload != NULL) {
             applyJump(payload);
             mutated = UPDATE_VIRTUAL_STATE;
+          }
+          break;
+        }
+        case ACTION_ITEM_SIZE_ESTIMATOR_CHANGE: {
+          // Fork delta 5: changing what unmeasured rows are guessed to be is
+          // itself a geometry mutation — recompensate exactly like a real
+          // resize (ACTION_ITEM_RESIZE): capture an anchor before, swap +
+          // invalidate, capture the same anchor after, applyJump the delta
+          // through the existing deferral instead of a silent offset change
+          // that would visibly shift content above the viewport. Shift mode
+          // keeps distance from the end (same rule shouldKeep uses for
+          // SCROLL_BY_SHIFT), so it compares total size instead of one
+          // anchor's offset.
+          if (setEstimator) {
+            const useTotal = _scrollMode === SCROLL_BY_SHIFT;
+            const anchorIndex = useTotal
+              ? 0
+              : findIndex(getOffset, getLength(), getVisibleOffset());
+            const before = useTotal
+              ? getTotalSize()
+              : getItemOffset(anchorIndex);
+            if (setEstimator(payload)) {
+              const after = useTotal
+                ? getTotalSize()
+                : getItemOffset(anchorIndex);
+              applyJump(after - before);
+              mutated = UPDATE_VIRTUAL_STATE;
+            }
           }
           break;
         }
