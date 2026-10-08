@@ -1,0 +1,76 @@
+# Publishes a fork release: gate → build → pack → attach → sha512.
+#
+# A fork tag `v<X.Y.Z>-jam.<n>` names the upstream version plus our revision.
+# The package version is stamped from the tag without a commit (upstream has
+# no prepare/prepack hook and `npm pack` excludes package-lock.json), so the
+# ONLY artifact identity that matters is: tag → tested commit → tarball bytes,
+# bound by the printed sha512 and recorded in tjam's pnpm-lock.yaml integrity.
+#
+# A red step anywhere above the publish step produces NO release. Assets are
+# never replaced in place: a superseded release is followed by a new
+# `-jam.<n>` tag (see FORK-CHANGES.md, F3).
+name: jam-release
+
+on:
+  push:
+    tags:
+      - "v*-jam.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest # the release runner provisions its own browsers;
+    timeout-minutes: 30   # it never depends on another job's cache
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+          cache: "npm"
+
+      - name: Install
+        run: npm ci
+
+      - name: Gate (unit + browser suites, WebKit included)
+        run: |
+          npx playwright install --with-deps
+          npm run tsc
+          npm test
+          # --retry=2 matches upstream check.yml's e2e browser step; the
+          # 3-browser matrix flakes on runner timing under parallel load.
+          npm run test:browser -- --retry=2
+
+      - name: Stamp version from the tag (uncommitted)
+        id: stamp
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          npm version "$ver" --no-git-tag-version --allow-same-version
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tarball=virtua-$ver.tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Build and pack
+        run: |
+          set -euo pipefail
+          npm run build
+          npm pack --filename "${{ steps.stamp.outputs.tarball }}"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARBALL: ${{ steps.stamp.outputs.tarball }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sha_b64=$(openssl dgst -sha512 -binary "$TARBALL" | openssl base64 -A)
+          echo "integrity=sha512-$sha_b64" >> "$GITHUB_STEP_SUMMARY"
+          echo "tarball=$TARBALL" >> "$GITHUB_STEP_SUMMARY"
+          sha256sum "$TARBALL" >> "$GITHUB_STEP_SUMMARY"
+          NOTES=$(printf 'Fork release of inokawa/virtua per FORK-CHANGES.md.\n\nIntegrity for tjam pnpm-lock.yaml: sha512-%s\n\nTested commit: %s\n' "$sha_b64" "$(git rev-parse HEAD)")
+          gh release create "$TAG" "$TARBALL" --verify-tag --title "$TAG" --notes "$NOTES"
+          echo "## jam-release" >> "$GITHUB_STEP_SUMMARY"
+          echo "Asset URL: $(gh release view "$TAG" --json assets --jq '.assets[0].url')" >> "$GITHUB_STEP_SUMMARY"
