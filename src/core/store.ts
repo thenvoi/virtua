@@ -457,6 +457,27 @@ export const createVirtualStore = (
             // Update synchronously if scrolled a lot
             shouldSync = distance > viewportSize;
           }
+
+          // Release the parked backlog before it strands the reader at a
+          // false ceiling. While corrections are deferred the content is
+          // shorter than reality, so the scroll bottoms out at 0 while real
+          // space still exists above — it stops early, often mid-message,
+          // and needs a second gesture to continue (FORK-CHANGES.md delta 3).
+          //
+          // Deliberately narrower than the disabled block above: start edge
+          // only, no direction test, and native mode only — the release
+          // exists for the gesture backlog, while a frozen-range (smooth
+          // scroll) park must survive until scroll end per #942. It also
+          // cannot fire at the end edge where that attempt broke reverse
+          // infinite scrolling.
+          if (
+            pendingJump &&
+            _scrollMode === SCROLL_BY_NATIVE &&
+            payload <= viewportSize
+          ) {
+            shouldFlushPendingJump = true;
+            mutated |= UPDATE_VIRTUAL_STATE;
+          }
           break;
         }
         case ACTION_SCROLL_END: {

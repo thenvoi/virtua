@@ -527,4 +527,49 @@ describe("WebKit mid-gesture deferral (FORK-CHANGES.md deltas 1–3)", () => {
     store.$update(ACTION_SCROLL_END);
     expect(store._flushJump()).toEqual([0, false]);
   });
+
+  it("releases a parked backlog at the start edge mid-gesture, before scroll end (delta 3)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    // Prime outside the gesture (same reason as the delta 1 test).
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5);
+    store._flushJump();
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
+    );
+    expect(store._flushJump()).toEqual([0, false]); // parked (delta 1)
+
+    // A delivered scroll near the start edge — the false-ceiling moment —
+    // releases the backlog without waiting for the gesture to end.
+    store.$update(ACTION_SCROLL, 5);
+    expect(store._flushJump()).toEqual([20, false]);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+
+  it("keeps the backlog parked while delivered scrolls stay off the start edge (delta 3 scope)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5);
+    store._flushJump();
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
+    );
+    expect(store._flushJump()).toEqual([0, false]); // parked (delta 1)
+
+    // Mid-page scroll (payload beyond one viewport from the start): the
+    // release must NOT fire — it is start-edge only, no direction test.
+    store.$update(ACTION_SCROLL, 300);
+    expect(store._flushJump()).toEqual([0, false]);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([20, false]);
+  });
 });
