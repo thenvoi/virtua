@@ -146,3 +146,10 @@ included).
   successor P1 gate after spec-only commits (the release tarball ships no
   specs, so a branch whose delta set matches a released one needs no
   re-release — only this green run).
+- **`.size-limit.json`** (fork-only config delta): every entry's budget is the
+  upstream number plus measured delta growth (~0.2–0.4 kB brotlied) plus
+  0.1 kB headroom. The correction/estimator code lives in shared `core/`, so
+  all 17 bundles grew; upstream's numbers were never re-baselined on the fork
+  because `check.yml` first ran on a `jam-<ver>` branch on 2026-10-08. On a
+  rebase where growth shifts, re-measure with `npm run build && npm run
+  size` and bump, never delete an entry.
