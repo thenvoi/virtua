@@ -5,6 +5,10 @@ on:
   push:
     branches:
       - main
+  # jam-<ver> successor branches are never `main`, so the gate that must be
+  # green before a pin bump is dispatchable (gh workflow run check.yml
+  # --ref jam-<ver>). Fork automation (FORK-CHANGES.md → Automation).
+  workflow_dispatch: {}
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
