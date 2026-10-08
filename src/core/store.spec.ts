@@ -507,4 +507,24 @@ describe("WebKit mid-gesture deferral (FORK-CHANGES.md deltas 1–3)", () => {
     }
     vi.resetModules();
   });
+
+  it("applies a parked backlog above one viewport through the gesture instead of parking it (delta 2)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5); // prime estimates; anchor resolves at index 5
+    store._flushJump();
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_USER_GESTURE, true);
+    // Index 1 grows 30 -> 100: a +70 correction, above the 50px viewport.
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 100 : 30,
+    );
+    // Delta 1 alone would park all of it until scroll end; the cap writes
+    // the backlog through immediately, so gesture end releases nothing more.
+    expect(store._flushJump()).toEqual([70, false]);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
 });

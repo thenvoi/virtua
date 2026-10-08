@@ -219,6 +219,20 @@ export const createVirtualStore = (
         (_frozenRange && _scrollMode === SCROLL_BY_MANUAL_SCROLL)
       ) {
         pendingJump += j;
+        // A parked correction is height the list does not yet know it has.
+        // Left unbounded it reaches thousands of pixels, and the scroll then
+        // bottoms out short of the real top while offsets map to rows that
+        // are not on screen. Cap the GESTURE backlog at one viewport and
+        // apply the excess immediately; the frozen-range park belongs to
+        // #942's contract and stays until scroll end (FORK-CHANGES.md delta 2).
+        if (
+          deferredByGesture &&
+          viewportSize &&
+          abs(pendingJump) > viewportSize
+        ) {
+          jump += pendingJump;
+          pendingJump = 0;
+        }
       } else {
         jump += j;
       }
