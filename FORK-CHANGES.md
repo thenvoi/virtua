@@ -139,3 +139,10 @@ included).
   sha512. A red test step produces no release. The release runner provisions
   its own browsers. Releases are immutable: a bad one is superseded by a new
   `-jam.<n>` tag, never replaced in place.
+- **`check.yml`** (upstream's workflow, one-line fork delta): added
+  `workflow_dispatch` so the full gate — tsc, unit, `test:browser --retry=2`
+  across Chromium/Firefox/WebKit — can run on a `jam-<ver>` branch, which is
+  never `main` and therefore never triggers the push event. Used as the
+  successor P1 gate after spec-only commits (the release tarball ships no
+  specs, so a branch whose delta set matches a released one needs no
+  re-release — only this green run).
