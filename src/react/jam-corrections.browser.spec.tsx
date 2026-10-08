@@ -11,14 +11,13 @@ import {
 } from "../../spec/browser/index.js";
 import { render, rerender } from "../../spec/browser/react.js";
 import { delay, nextFrame, range } from "../../spec/utils.js";
-// The witness mock wraps core's scroll observer, so its TYPE surface must be
-// named where it lives; the zone rule exists to keep runtime code layered —
-// these are type-only imports and the vi.mock path string must resolve to
-// core/observer.js exactly.
+// The witness mock wraps core's container driver, so its TYPE surface must
+// be named where it lives. These type-only imports and the vi.mock path
+// string name core/driver.js exactly; runtime layering stays unchanged.
 /* eslint-disable import/no-restricted-paths */
-import type * as Observed from "../core/observer.js";
+import type * as Observed from "../core/driver.js";
 import type { VirtualStore } from "../core/store.js";
-import type { ScrollObserver } from "../core/observer.js";
+import type { Driver } from "../core/driver.js";
 /* eslint-enable import/no-restricted-paths */
 
 afterEach(cleanupScroll);
@@ -36,20 +35,20 @@ const witness: {
   writes: ("absolute" | "relative")[];
 } = { open: false, flushes: [], writes: [] };
 
-vi.mock("../core/observer.js", async (importOriginal) => {
+vi.mock("../core/driver.js", async (importOriginal) => {
   const actual = await importOriginal<typeof Observed>();
   return {
     ...actual,
-    createScrollObserver: (
+    createContainerDriver: (
       store: VirtualStore,
-      ...rest: Parameters<typeof actual.createScrollObserver> extends [
+      ...rest: Parameters<typeof actual.createContainerDriver> extends [
         VirtualStore,
         ...infer R,
       ]
         ? R
         : never
     ) => {
-      const scroller = rest[1] as HTMLElement;
+      let scroller: HTMLElement | undefined;
       const originalFlushJump = store._flushJump;
       store._flushJump = () => {
         const result = originalFlushJump();
@@ -58,14 +57,16 @@ vi.mock("../core/observer.js", async (importOriginal) => {
         }
         return result;
       };
-      const observer: ScrollObserver = actual.createScrollObserver(
-        store,
-        ...rest,
-      );
-      const originalFixScrollJump = observer._fixScrollJump;
-      observer._fixScrollJump = () => {
-        if (!witness.open) {
-          return originalFixScrollJump();
+      const driver: Driver = actual.createContainerDriver(store, ...rest);
+      const originalObserve = driver.$observe;
+      driver.$observe = (container, viewport = container.parentElement!) => {
+        scroller = viewport;
+        return originalObserve(container, viewport);
+      };
+      const originalEffect = driver.$effect;
+      driver.$effect = () => {
+        if (!witness.open || !scroller) {
+          return originalEffect();
         }
         const originalScrollTo = scroller.scrollTo;
         const originalScrollBy = scroller.scrollBy;
@@ -78,13 +79,13 @@ vi.mock("../core/observer.js", async (importOriginal) => {
           return originalScrollBy.apply(scroller, a);
         }) as typeof scroller.scrollBy;
         try {
-          return originalFixScrollJump();
+          return originalEffect();
         } finally {
           scroller.scrollTo = originalScrollTo;
           scroller.scrollBy = originalScrollBy;
         }
       };
-      return observer;
+      return driver;
     },
   };
 });

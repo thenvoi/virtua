@@ -19,33 +19,66 @@ workflow gates and publishes the tarball), then bump tjam's pin + inventory.
 A tjam `fork-freshness` watcher files an issue when a staged branch outruns the
 pin.
 
-## 1–3. WKWebView deferral, backlog cap, start-edge release — RETIRED
+## 1–3. WKWebView deferral, backlog cap, start-edge release — RE-ADDED (F7)
 
-Not carried on this fork. The vendored copy deferred scroll corrections during
-any WebKit gesture (`isWebKit` in `core/environment.ts`, used in
-`core/store.ts`'s `applyJump`), capped the deferred backlog at one viewport, and
-released it early at the start edge — three changes that made Band's conversation
-feed survive WKWebView's revert of mid-gesture `scrollTop` writes.
+Three interacting changes that make Band's conversation feed survive WKWebView's
+revert of mid-gesture `scrollTop` writes: delta 1 defers size corrections in any
+WebKit — not only iOS — until the gesture ends; delta 2 caps the deferred
+backlog at one viewport; delta 3 releases it early at the start edge. The cap
+and the release exist only for the deferral, so the three land or revert
+together.
 
-Upstream 0.51.0 (PR [#942](https://github.com/inokawa/virtua/pull/942)) fixed the
-underlying defect class differently: mid-range corrections are applied with
-relative `scrollBy` "not to overwrite concurrent scrolling" (closing upstream
-issue #367), and absolute `scrollTo` writes remain only at the scroll edges.
-Band's three changes are retired in favor of #942, gated by:
+History: Band's vendored copy carried these as changes 1–3 on `virtua@0.50.0`
+(tjam `apps/desktop/src/lib/virtua/README.md` §"Local changes"). The first port
+to 0.53.3 retired them in favor of upstream PR
+[#942](https://github.com/inokawa/virtua/pull/942), which applies mid-range
+corrections with relative `scrollBy` "not to overwrite concurrent scrolling"
+(closing upstream issue #367), keeping absolute `scrollTo` writes only at the
+scroll edges. The owner's packaged macOS A/B on his 120Hz display (2026-10-08;
+tjam `docs/plans/virtua-fork-dependency.md` Appendix C) showed #942 does not
+cover the symptom class while a flick decelerates and new rows measure — the
+1-frame grow-and-settle appeared on nearly every stroke against the vendored
+baseline's roughly one in five. That invoked the F7 fallback: these three
+commits, released as `v0.53.3-jam.2`.
+
+Implementation on this branch:
+
+- **Delta 1** (`core/environment.ts`, `core/store.ts`, `core/observer.ts`):
+  `isWebKit` — every WebKit engine, Chromium and Edge excluded by name —
+  joins the deferral guard via the wheel/touch seam of a new
+  `ACTION_USER_GESTURE` reported by the scroll observer. A Tauri desktop app
+  runs WKWebView, whose user agent matches neither branch of upstream's
+  iOS-only check. Keying the desktop branch on the gesture, not on scroll
+  direction, is the port's one adaptation to the 0.53.3 structure: 0.53.3's
+  own suites encode #942's semantics for PROGRAMMATIC scrolls, which must
+  keep immediate relative writes; WKWebView reverts only writes made during
+  a user gesture — exactly when the observer sees wheel/touch activity. iOS
+  keeps upstream's direction-based branch unchanged.
+- **Delta 2** (`core/store.ts`): a parked correction is height the list does
+  not yet know it has. Unbounded it reached thousands of pixels — the scroll
+  bottomed out short of the real top while offsets mapped onto rows that were
+  not on screen. Past one viewport, the backlog is applied immediately.
+- **Delta 3** (`core/store.ts`): while corrections are parked the content is
+  shorter than reality, so the scroll can stop at a false ceiling mid-message
+  and need a second gesture. Release fires at the start edge only, with no
+  direction test and in native mode only — deliberately narrower than
+  upstream's disabled attempt in the same `ACTION_SCROLL` branch, which
+  broke reverse infinite scrolling. The mode gate is this port's adaptation:
+  a frozen-range (smooth-scroll) park must survive until scroll end per
+  #942, as must delta 2's cap, which likewise applies only to the gesture
+  backlog.
+
+Gated by:
 
 - **P7a (deterministic, this repo):** `src/jam-corrections.browser.spec.tsx`
   and `src/react/jam-corrections.browser.spec.tsx` prove on Chromium, Firefox,
   and WebKit that the correction branches — mid-range relative (#367),
   absolute-top, absolute-end — keep the reader's anchor row still, with
-  suppression probes proving each can fail.
-- **P7b (native, tjam):** a packaged macOS run must show none of the three
-  original symptoms (jump as a flick decelerates, scroll bottoming out short
-  of the real top, false ceiling mid-message) relative to the vendored
-  baseline.
-
-**Fallback (F7):** if P7b regresses, port the three changes back as three
-commits on the `jam-<ver>` branch and cut `v<ver>-jam.2`; they interact (the cap
-and release only exist for the deferral), so they land or revert together.
+  suppression probes proving each can fail. #942's relative application
+  composes with the deferral; the P7a set is what adjudicates the interaction.
+- **P7b (native, tjam):** the packaged macOS A/B that triggered this port
+  must show the deceleration symptom on `v0.53.3-jam.2` at or below the
+  vendored baseline's frequency.
 
 ## 4. `react/Virtualizer.tsx` — cache each rendered row
 

@@ -12,9 +12,9 @@ import {
 } from "../spec/browser/index.js";
 import { render, rerender } from "../spec/browser/react.js";
 import { nextFrame, range } from "../spec/utils.js";
-import type * as Observed from "./core/observer.js";
+import type * as Observed from "./core/driver.js";
 import type { VirtualStore } from "./core/store.js";
-import type { ScrollObserver } from "./core/observer.js";
+import type { Driver } from "./core/driver.js";
 
 afterEach(cleanupScroll);
 
@@ -26,12 +26,11 @@ afterEach(cleanupScroll);
 // owns that half.
 //
 // Two observation windows per correction (plan U1 step 5):
-// - PROVENANCE: a narrow synchronous interval around the observer's
-//   _fixScrollJump. The upstream observer exposes _sync/_dispose/
-//   _fixScrollJump/_scroll — not scrollTo/scrollBy — and writes through the
-//   scroller element inside _fixScrollJump: an absolute `scroller.scrollTo`
-//   at the edges, a relative `scroller.scrollBy` mid-range. The vi.mock
-//   factory wraps createScrollObserver so that, while an interval is open,
+// - PROVENANCE: a narrow synchronous interval around driver.$effect, the
+//   correction path after upstream folded the observer into the driver.
+//   Its private observer writes absolute `scroller.scrollTo` at the edges
+//   and relative `scroller.scrollBy` mid-range. The vi.mock factory wraps
+//   createContainerDriver so that, while an interval is open,
 //   the store's _flushJump result is recorded (calling the original exactly
 //   once and returning it unchanged — a second call would read a cleared
 //   jump) and the scroller's writes are labeled. Imperative writes outside
@@ -48,20 +47,20 @@ const witness: {
   writes: ("absolute" | "relative")[];
 } = { open: false, flushes: [], writes: [] };
 
-vi.mock("./core/observer.js", async (importOriginal) => {
+vi.mock("./core/driver.js", async (importOriginal) => {
   const actual = await importOriginal<typeof Observed>();
   return {
     ...actual,
-    createScrollObserver: (
+    createContainerDriver: (
       store: VirtualStore,
-      ...rest: Parameters<typeof actual.createScrollObserver> extends [
+      ...rest: Parameters<typeof actual.createContainerDriver> extends [
         VirtualStore,
         ...infer R,
       ]
         ? R
         : never
     ) => {
-      const scroller = rest[1] as HTMLElement;
+      let scroller: HTMLElement | undefined;
       const originalFlushJump = store._flushJump;
       store._flushJump = () => {
         const result = originalFlushJump();
@@ -70,14 +69,16 @@ vi.mock("./core/observer.js", async (importOriginal) => {
         }
         return result;
       };
-      const observer: ScrollObserver = actual.createScrollObserver(
-        store,
-        ...rest,
-      );
-      const originalFixScrollJump = observer._fixScrollJump;
-      observer._fixScrollJump = () => {
-        if (!witness.open) {
-          return originalFixScrollJump();
+      const driver: Driver = actual.createContainerDriver(store, ...rest);
+      const originalObserve = driver.$observe;
+      driver.$observe = (container, viewport = container.parentElement!) => {
+        scroller = viewport;
+        return originalObserve(container, viewport);
+      };
+      const originalEffect = driver.$effect;
+      driver.$effect = () => {
+        if (!witness.open || !scroller) {
+          return originalEffect();
         }
         const originalScrollTo = scroller.scrollTo;
         const originalScrollBy = scroller.scrollBy;
@@ -90,13 +91,13 @@ vi.mock("./core/observer.js", async (importOriginal) => {
           return originalScrollBy.apply(scroller, a);
         }) as typeof scroller.scrollBy;
         try {
-          return originalFixScrollJump();
+          return originalEffect();
         } finally {
           scroller.scrollTo = originalScrollTo;
           scroller.scrollBy = originalScrollBy;
         }
       };
-      return observer;
+      return driver;
     },
   };
 });
@@ -199,7 +200,6 @@ describe("prepend committed between two scroll deliveries while scrolling toward
 
     // the older page commits in the gap between the two deliveries
     items = [...range(ADDED, (i) => `item-${i - ADDED}`), ...items];
-    openWitness();
     openWitness();
     rerender(root, <List items={items} shift />);
     // React root renders commit asynchronously — the shift correction lands

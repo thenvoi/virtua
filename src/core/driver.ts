@@ -8,6 +8,7 @@ import {
   type VirtualStore,
   ACTION_SCROLL_END,
   ACTION_START_OFFSET_CHANGE,
+  ACTION_USER_GESTURE,
   ACTION_MANUAL_SCROLL,
   ACTION_BEFORE_MANUAL_SMOOTH_SCROLL,
   ACTION_ITEM_RESIZE,
@@ -108,6 +109,7 @@ const createScrollObserver = (
 
     justTouchEnded = false;
 
+    store.$update(ACTION_USER_GESTURE, false);
     store.$update(ACTION_SCROLL_END);
   };
   const scheduleScrollEnd = () => {
@@ -133,6 +135,11 @@ const createScrollObserver = (
   // Infer scroll state also from wheel events
   // Sometimes scroll events do not fire when frame dropped even if the visual have been already scrolled
   const onWheel = ((e: WheelEvent) => {
+    // Fork delta 1 seam: report user-gesture activity before inference
+    // filtering. Pinch-zoom does not scroll.
+    if (!e.ctrlKey && store.$isScrolling()) {
+      store.$update(ACTION_USER_GESTURE, true);
+    }
     if (
       wheeling ||
       // Scroll start should be detected with scroll event
@@ -159,10 +166,14 @@ const createScrollObserver = (
 
   const onTouchStart = () => {
     touching = true;
+    store.$update(ACTION_USER_GESTURE, true);
     justTouchEnded = stillMomentumScrolling = false;
   };
   const onTouchEnd = () => {
     touching = false;
+    // iOS momentum is covered by the direction branch. Desktop wheels
+    // re-report activity; touch lift must not leave the seam active.
+    store.$update(ACTION_USER_GESTURE, false);
     if (isIOSWebKit()) {
       justTouchEnded = true;
     }
