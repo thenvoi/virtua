@@ -8,6 +8,8 @@ import { min, sort } from "../utils.js";
 export interface ListLayout extends Layout {
   $snapshot(): CacheSnapshot;
   $setEstimator(estimator: ItemSizeEstimator | null): boolean;
+  $remapSource(): readonly number[];
+  $replaceSizes(sizes: readonly number[]): void;
 }
 
 /**
@@ -209,5 +211,20 @@ export const createListLayout = (
     },
     $isEstimating: () => shouldAutoEstimateItemSize,
     $snapshot: () => [sizes.slice(), defaultItemSize],
+    $remapSource: () => sizes,
+    // Remap is an arbitrary identity reorder, not a uniform shift: an
+    // estimate computed for old index i has no guaranteed relationship to
+    // whatever is now at new index i. Discard the estimates wholesale, and
+    // the offset cache — remap already rebuilds sizes from the source order.
+    $replaceSizes: (next) => {
+      sizes.length = next.length;
+      for (let index = 0; index < next.length; index++) {
+        sizes[index] = next[index]!;
+      }
+      for (let index = 0; index < estimates.length; index++) {
+        estimates[index] = UNCACHED;
+      }
+      computedOffsetIndex = -1;
+    },
   };
 };
