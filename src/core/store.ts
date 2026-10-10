@@ -48,6 +48,14 @@ export const ACTION_ITEM_SIZE_ESTIMATOR_CHANGE = 10;
  * @internal
  */
 export const ACTION_USER_GESTURE = 11;
+/**
+ * Fork delta 7 seam: the burst quiescence window elapsed after a
+ * remap-transaction re-point. The scroll observer owns the timing and
+ * dispatches this once the measurement wave has gone quiet; it does not
+ * preempt an active gesture/settle hold, whose release owns the commit.
+ * @internal
+ */
+export const ACTION_BURST_SETTLED = 12;
 
 type Actions =
   | [type: typeof ACTION_SCROLL, offset: number]
@@ -66,7 +74,8 @@ type Actions =
       type: typeof ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
       estimator: ItemSizeEstimator | null,
     ]
-  | [type: typeof ACTION_USER_GESTURE, active: boolean];
+  | [type: typeof ACTION_USER_GESTURE, active: boolean]
+  | [type: typeof ACTION_BURST_SETTLED, dummy?: void];
 
 /** @internal */
 export const UPDATE_VIRTUAL_STATE = 0b0001;
@@ -104,6 +113,22 @@ export type VirtualStore = {
   $getScrollOffset(): number;
   $getVisibleOffset(): number;
   $isScrolling(): boolean;
+  /**
+   * Fork delta 7 seam: true while a successful remap's measurement wave is
+   * awaiting its batched commit. The scroll observer times the quiescence
+   * window; the store stays synchronous.
+   */
+  $isBurstPending(): boolean;
+  /**
+   * Fork delta 1 (jam.3 final) seam: true while the settle hold is ACTIVE —
+   * armed by a gesture release into a moving position (delta 1's revision)
+   * and not yet released, in native scroll mode. This is exactly the window
+   * in which delivered corrections park (the park condition's WebKit +
+   * native-mode terms), so the scroll observer's settle-window re-arm keys
+   * on it; marked imperative operations keep their own #942 release
+   * contract. The store stays synchronous; the observer owns the timing.
+   */
+  $isSettleHeld(): boolean;
   $getViewportSize(): number;
   $getStartSpacerSize(): number;
   $getTotalSize(): number;
@@ -161,6 +186,21 @@ export const createVirtualStore = (
   // active; the desktop-WebKit deferral keys on this, not on direction —
   // programmatic scrolls must keep #942's immediate relative writes.
   let _userGestureActive = false;
+  // Fork delta 1, jam.3 revision: a gesture that released while the scroll
+  // position was still changing hands the hold to the settle state. The
+  // backlog stays parked through the momentum tail — on WKWebView the tail
+  // keeps the viewport moving after release, and a correction written into
+  // it is reverted later, the one-frame drop-and-return. The hold ends at
+  // the observer's scroll-end: its 150ms debounce is the position-stability
+  // window (no delivered scroll-position delta for that long), and it is the
+  // single flush point the backlog already merges through.
+  let _awaitingSettle = false;
+  // Fork delta 7: armed by a successful remap — the re-point/remount
+  // transaction whose rows re-measure as a wave. The wave parks (capped like
+  // any parked backlog) until the scroll observer's quiescence window
+  // elapses, so the transaction commits once, anchored, instead of writing
+  // per ResizeObserver delivery (FORK-CHANGES.md delta 7).
+  let _burstPending = false;
   let _scrollMode: ScrollMode = SCROLL_BY_NATIVE;
   let _frozenRange: ItemsRange | null = NULL;
   let _prevRange: ItemsRange = [0, isSSR ? max(ssrCount - 1, 0) : -1];
@@ -208,12 +248,23 @@ export const createVirtualStore = (
         // so it have to be deferred during scrolling.
         (isIOSWebKit() && _scrollDirection !== SCROLL_IDLE) ||
         // Desktop WebKit (WKWebView) reverts a scroll position written during
-        // a USER gesture; on 0.53.3 the deferral keys on the observer's
-        // wheel/touch seam rather than direction, so programmatic scrolls
-        // keep #942's relative writes (FORK-CHANGES.md delta 1).
-        (isWebKit() && _userGestureActive);
+        // a USER gesture or the momentum tail that follows one; on 0.53.3 the
+        // deferral keys on the observer's gesture seam and its settle
+        // hand-off, never on direction, so programmatic scrolls keep #942's
+        // relative writes (FORK-CHANGES.md delta 1). The settle term stays
+        // confined to native mode: a marked imperative operation (manual /
+        // smooth machinery) owns its own release contract per #942.
+        (isWebKit() &&
+          (_userGestureActive ||
+            (_awaitingSettle && _scrollMode === SCROLL_BY_NATIVE)));
+      // Fork delta 7: the remap transaction's measurement wave batches
+      // engine-agnostically — no gesture, no momentum; the vehicle is the
+      // same park-and-merge the gesture hold uses, the release is burst
+      // settle. Ordinary resizes never carry this flag.
+      const deferredByBurst = _burstPending;
       if (
         deferredByGesture ||
+        deferredByBurst ||
         // Before imperative smooth scrolling, we measure all items which may be visible during scrolling.
         // However, especially in Firefox, there are rare cases where items resize while scrolling, which can stop smooth scrolling.
         (_frozenRange && _scrollMode === SCROLL_BY_MANUAL_SCROLL)
@@ -226,9 +277,19 @@ export const createVirtualStore = (
         // apply the excess immediately; the frozen-range park belongs to
         // #942's contract and stays until scroll end (FORK-CHANGES.md delta 2).
         if (
-          deferredByGesture &&
+          (deferredByGesture || deferredByBurst) &&
           viewportSize &&
-          abs(pendingJump) > viewportSize
+          abs(pendingJump) > viewportSize &&
+          // jam.3 final contract (CAP): zero-writes-during-gesture wins
+          // over the escape while a user gesture or its WebKit settle
+          // hand-off owns the tail in native mode — a >1-viewport backlog
+          // then keeps parking and commits whole at rest. Programmatic
+          // and burst transactions escape as before (both flags false).
+          !(
+            isWebKit() &&
+            _scrollMode === SCROLL_BY_NATIVE &&
+            (_userGestureActive || _awaitingSettle)
+          )
         ) {
           jump += pendingJump;
           pendingJump = 0;
@@ -318,6 +379,12 @@ export const createVirtualStore = (
     _flushedJump = 0;
     _frozenRange = NULL;
     _scrollMode = SCROLL_BY_NATIVE;
+    // Fork delta 7: this transaction re-points the identity the measured-size
+    // cache describes; the wave of re-measurements it triggers must commit
+    // once, anchored, not per ResizeObserver delivery. Arm BEFORE the notify
+    // so the scroll observer's quiescence window starts from the transaction
+    // itself and re-arms on every wave event (FORK-CHANGES.md delta 7).
+    _burstPending = true;
     stateVersion = (stateVersion & MAX_INT_32) + 1;
     subscribers.forEach(([target, cb]) => {
       if (target & UPDATE_VIRTUAL_STATE) cb(false);
@@ -378,6 +445,8 @@ export const createVirtualStore = (
     $getScrollOffset: () => scrollOffset,
     $getVisibleOffset: getVisibleOffset,
     $isScrolling: () => _scrollDirection !== SCROLL_IDLE,
+    $isBurstPending: () => _burstPending,
+    $isSettleHeld: () => _awaitingSettle && _scrollMode === SCROLL_BY_NATIVE,
     $getViewportSize: () => viewportSize,
     $getStartSpacerSize: () => startSpacerSize,
     $getTotalSize: getTotalSize,
@@ -458,38 +527,63 @@ export const createVirtualStore = (
             shouldSync = distance > viewportSize;
           }
 
-          // Release the parked backlog before it strands the reader at a
-          // false ceiling. While corrections are deferred the content is
-          // shorter than reality, so the scroll bottoms out at 0 while real
-          // space still exists above — it stops early, often mid-message,
-          // and needs a second gesture to continue (FORK-CHANGES.md delta 3).
-          //
-          // Deliberately narrower than the disabled block above: start edge
-          // only, no direction test, and native mode only — the release
-          // exists for the gesture backlog, while a frozen-range (smooth
-          // scroll) park must survive until scroll end per #942. It also
-          // cannot fire at the end edge where that attempt broke reverse
-          // infinite scrolling.
-          if (
-            pendingJump &&
-            _scrollMode === SCROLL_BY_NATIVE &&
-            payload <= viewportSize
-          ) {
-            shouldFlushPendingJump = true;
-            mutated |= UPDATE_VIRTUAL_STATE;
+          // jam.3 EDGE-START, live at edge-REACH (the reviewer's
+          // prescription): the start-edge invariant is GEOMETRY, and the
+          // READER's own scroll event is where it becomes due. While a
+          // debt is parked and this scroll puts the CURRENT position at
+          // or past the start edge (relative + jump <= 0, elastic
+          // negatives included), the debt is cleared from the offset
+          // channel ON THIS EVENT: getItemOffset = getOffset −
+          // pendingJump rides EVERY row, so a clear that waits for the
+          // settle flush leaves the rows displaced (±Δ, zero writes) for
+          // the whole pre-settle interval. Geometry-only invalidation —
+          // no scroll write (ZW stays absolute through the gesture and
+          // the settle-flush write release is untouched), no release of
+          // the gesture/settle holds (the epoch and its timers keep
+          // governing), no change to mid-viewport or end-edge
+          // compensation. Delta 3's scroll-compensated edge release
+          // stays SUPERSEDED (FORK-CHANGES delta 3): the disabled
+          // upstream flush block above stays disabled. The flush-branch
+          // clear remains the BACKSTOP for paths that never transit a
+          // scroll event at the edge — programmatic sets, burst-only
+          // waves, idle-at-edge.
+          if (pendingJump && relativeOffset + jump <= 0) {
+            pendingJump = 0;
+            if (!(mutated & UPDATE_VIRTUAL_STATE)) {
+              // next frame: range recomputed from TRUE geometry at the
+              // OS-owned position
+              mutated += UPDATE_VIRTUAL_STATE;
+            }
           }
           break;
         }
         case ACTION_SCROLL_END: {
           mutated = UPDATE_SCROLL_END_EVENT;
-          if (_scrollDirection !== SCROLL_IDLE) {
+          // Scroll-end IS the backlog's release point — direction or not.
+          // Upstream keyed the flush on a non-idle direction (before ZW a
+          // parked backlog could only exist inside a MOVING session); the
+          // final contract also parks during a gesture that never delivers
+          // position to the release (probe (v): touch, a measurement above,
+          // lift — the epoch ends at idle direction and MUST still commit).
+          // The conversion below applies EDGE/CAP at the commit. The single
+          // deferral is a LIVE burst (R1, jam.3): a scroll-end timer armed
+          // BEFORE a remap firing mid-wave must neither flush the partial
+          // backlog nor disarm — the merged commit is the wave's quiescence
+          // (ACTION_BURST_SETTLED).
+          if (!_burstPending) {
             shouldFlushPendingJump = true;
-            mutated += UPDATE_VIRTUAL_STATE;
           }
+          mutated += UPDATE_VIRTUAL_STATE;
+          // State resets stay unconditional: the position HAS settled, so a
+          // live gesture/settle hold releases here regardless of the burst
+          // (the backlog it parked is the burst's to commit at quiescence).
           _scrollDirection = SCROLL_IDLE;
           _scrollMode = SCROLL_BY_NATIVE;
           _frozenRange = NULL;
           _userGestureActive = false;
+          _awaitingSettle = false; // settled (delta 1, jam.3 revision)
+          // _burstPending is NOT cleared here — only the quiescence timer
+          // disarms a live burst (delta 7).
           break;
         }
         case ACTION_ITEM_RESIZE: {
@@ -554,6 +648,31 @@ export const createVirtualStore = (
         }
         case ACTION_USER_GESTURE: {
           _userGestureActive = payload;
+          // Fork delta 1, jam.3 revision: a new gesture owns the hold and
+          // clears the settle arm — the arm re-derives from the position
+          // state when THAT gesture releases. A release with the position
+          // still changing (direction != IDLE, i.e. the scroll-end debounce
+          // has not elapsed since the last delivered delta) arms the tail
+          // hold; a release of a stable position is a plain jam.2 release.
+          _awaitingSettle = payload ? false : _scrollDirection !== SCROLL_IDLE;
+          break;
+        }
+        case ACTION_BURST_SETTLED: {
+          // Fork delta 7: the quiescence window elapsed; hand the parked
+          // wave to the single flush path UNLESS a live hold owns the
+          // release — a WebKit gesture/settle hold (its scroll-end merges
+          // the same pendingJump) or a frozen-range park (#942's contract).
+          // Not early-breaking on the flag: a leftover backlog must never
+          // strand unpurchased.
+          _burstPending = false;
+          if (
+            pendingJump &&
+            !(isWebKit() && (_userGestureActive || _awaitingSettle)) &&
+            !(_frozenRange && _scrollMode === SCROLL_BY_MANUAL_SCROLL)
+          ) {
+            shouldFlushPendingJump = true;
+            mutated |= UPDATE_VIRTUAL_STATE;
+          }
           break;
         }
         case ACTION_START_OFFSET_CHANGE: {
@@ -611,7 +730,31 @@ export const createVirtualStore = (
         stateVersion = (stateVersion & MAX_INT_32) + 1;
 
         if (shouldFlushPendingJump && pendingJump) {
-          jump += pendingJump;
+          // jam.3 final contract (EDGE-START, park → CLEAR): the re-sync
+          // writes when there is room below the edge — CURRENT (relative
+          // + jump) strictly inside the content — folding the parked debt
+          // into the one write, #942 anchor parity, identically from the
+          // live-scroll and burst-quiescence flush paths. At or past the
+          // start edge (current <= 0, elastic negatives included, gesture
+          // and idle alike): NO scroll write AND pendingJump = 0. The
+          // clear is mandatory, not a retention: getItemOffset =
+          // getOffset − pendingJump carries the parked debt through EVERY
+          // item offset, so retaining it AT the edge displaces the whole
+          // list visually — a shrink parks a blank band below the top
+          // (row0 at +Δ with nothing above it), a growth clips the first
+          // row (row0 at −Δ) — a fork-injected displacement without ever
+          // touching scrollTop. The debt is one-shot anchor preservation
+          // at a layout change; once the reader's own scroll has REACHED
+          // the edge it is stale — ACTION_SCROLL clears it there live —
+          // and this flush-site clear is the backstop for positions that
+          // never transit a scroll event at the edge; the next
+          // measurement re-derives it if the anchor is back in range. Inside
+          // the content the write
+          // proceeds as before; end edge, idle mid-viewport compensation,
+          // programmatic and burst escapes: unchanged.
+          if (getRelativeScrollOffset() + jump > 0) {
+            jump += pendingJump;
+          }
           pendingJump = 0;
         }
 

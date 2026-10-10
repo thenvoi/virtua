@@ -41,6 +41,35 @@ cover the symptom class while a flick decelerates and new rows measure — the
 baseline's roughly one in five. That invoked the F7 fallback: these three
 commits, released as `v0.53.3-jam.2`.
 
+Revision (jam.3): the owner's confirmation against the jam.2 pin —
+the gesture-keyed hold releases at scroll-end, but on WKWebView the
+scroller is not settled when it does: the momentum tail keeps the viewport
+moving after lift-off, rows the deceleration reveals measure mid-tail, and
+their corrections land where WKWebView reverts them — the same
+drop-and-return, at gesture end rather than mid-stroke. Delta 1's desktop
+WebKit condition is therefore revised from gesture-keyed to
+**settle-keyed**: the hold spans the gesture _and_ the tail, parking until
+the position is stable — no delivered scroll-position delta for the
+stability window. Jam.3 used the observer's 150 ms scroll-end debounce as
+that window, one event for "settled" and "scroll ended". The owner's A/B
+against the corrected build showed the residual that leaves open: on a
+120 Hz tail the DELIVERED events can gap past 150 ms, the timer fires
+mid-gap, and the release lets a straggler correction land after the hold
+is gone. For the first corrected build the two windows were separated: the
+debounce stayed 150 ms for everything else, while a fire landing with the
+settle hold ACTIVE re-armed once for the remainder of a 300 ms stability
+window. The owner's further A/B then exposed what a fixed window cannot
+hold: his trackpad tails run well past a second, delivered events gap past
+150 ms mid-tail — where his ~50px shift is expected to come from, pending
+the paired native trace (§8, gate G5) — and a
+flush landing the moment deceleration ends gets eaten by the next
+gesture's rubber-band (the suppressed-overshoot flick). Jam.3's final form
+is therefore EVENT-DRIVEN — `SETTLE_STABILITY` (300 ms) of SIGNAL silence,
+the deadline sliding with every wheel or scroll event, no fixed total
+budget — with the release gated on a hand having been on glass this
+session and the store's settle hold (see §8 for the final write-discipline
+contract these gates serve).
+
 Implementation on this branch:
 
 - **Delta 1** (`core/environment.ts`, `core/store.ts`, `core/observer.ts`):
@@ -53,11 +82,52 @@ Implementation on this branch:
   own suites encode #942's semantics for PROGRAMMATIC scrolls, which must
   keep immediate relative writes; WKWebView reverts only writes made during
   a user gesture — exactly when the observer sees wheel/touch activity. iOS
-  keeps upstream's direction-based branch unchanged.
+  keeps upstream's direction-based branch unchanged. The jam.3 revision adds
+  a settle arm to the same seam (`store._awaitingSettle`): a gesture release
+  with the position still changing keeps parking through the tail, a new
+  gesture re-takes the hold, and scroll-end — the stability window elapsing —
+  releases once through the existing flush path. The jam.3 final revision
+  turns that release into a two-condition gate, evaluated at every
+  scroll-end timer fire: (1) no hand on glass — the gate enters only for a
+  session that reported a user gesture since the last scroll-end
+  (`gestureSeen`, set at the observer's gesture-ON seam sites, cleared only
+  by the dispatch), and every wheel or scroll event slides the deadline, so
+  a gesture re-engaging mid-window — a rubber-band flick — defers the flush
+  with it; (2) `SETTLE_STABILITY` (300 ms) of SIGNAL silence — scroll OR
+  wheel, no fixed total budget: a 1 s+ tail stays held and settles ~window
+  after its LAST event. A correction merging inside the window rides the
+  window's single at-rest re-sync — accepted epoch semantics: the
+  merge-restart first sketched for this gate was adjudicated a non-item,
+  because compensating before the window closes only risks racing a
+  still-arriving tail (the pre-fix flicker is exactly that write racing
+  motion), while a restart rule would defer the invisible at-rest re-sync
+  and starve it on a continuously measuring list. The hold term is
+  `store.$isSettleHeld` — armed AND native mode, matching the park
+  semantics exactly. Each gate term is load-bearing: the hold ARM keys on
+  movement alone (a raw programmatic `scrollTop` step also releases into it
+  — harmlessly pre-fix, same-tick), so without the session term the webkit
+  compensation and estimator suites land their releases 150 ms late;
+  without the engine term the #942 engines get held too; without the wheel
+  fold-in the gappy wheel-only streams fire mid-gesture (the report above
+  hands the park to the gesture flag while wheeling, which is why the fold
+  keys on the SESSION, not the hold flag). The wheel pulse within the
+  window after the last delivered position still re-reports the gesture (a
+  dropped-frame debounce gap on a 120 Hz display must not end the hold
+  mid-tail; programmatic scrolls dispatch no wheel events, so #942 is
+  untouched). The settle term is confined to native scroll mode; marked
+  imperative operations keep their #942 contract, and deltas 2's cap and
+  3's start-edge release apply to the tail backlog exactly as to the
+  gesture backlog — with §8 re-scoping both.
 - **Delta 2** (`core/store.ts`): a parked correction is height the list does
   not yet know it has. Unbounded it reached thousands of pixels — the scroll
   bottomed out short of the real top while offsets mapped onto rows that were
-  not on screen. Past one viewport, the backlog is applied immediately.
+  not on screen. Past one viewport, the backlog is applied immediately — an
+  ESCAPE, not a per-write limit: the whole accumulated correction commits
+  in one write and the backlog clears, and no per-write cap was ever
+  introduced. §8 re-scopes WHEN it may fire: the escape commits at idle
+  only; a backlog that grows past the viewport during a gesture parks
+  whole and lands, full magnitude, in the single rest write (burst and
+  programmatic escapes unchanged).
 - **Delta 3** (`core/store.ts`): while corrections are parked the content is
   shorter than reality, so the scroll can stop at a false ceiling mid-message
   and need a second gesture. Release fires at the start edge only, with no
@@ -66,7 +136,16 @@ Implementation on this branch:
   broke reverse infinite scrolling. The mode gate is this port's adaptation:
   a frozen-range (smooth-scroll) park must survive until scroll end per
   #942, as must delta 2's cap, which likewise applies only to the gesture
-  backlog.
+  backlog. SUPERSEDED by §8 (jam.3 final, EDGE-START): at the start edge
+  a correction applies geometry only, during a gesture and at rest alike,
+  AND the parked debt is cleared there LIVE — the reader's own scroll
+  event onto the edge removes it from the item-offset mapping
+  (geometry-only invalidation), the settle/burst flush clearing being the
+  backstop — so offsets return to true geometry at edge-reach, not
+  settle-lagged (the debt's duty is one-shot anchor preservation at the
+  layout change; the free scroll to the edge voids it). The false ceiling
+  is lifted by the rest commit, never by a write at or into the elastic
+  region. The paragraph above describes jam.2's shipped shape.
 
 Gated by:
 
@@ -76,8 +155,35 @@ Gated by:
   absolute-top, absolute-end — keep the reader's anchor row still, with
   suppression probes proving each can fail. #942's relative application
   composes with the deferral; the P7a set is what adjudicates the interaction.
+  The jam.3 momentum-tail case drives the seam with plain-Event touch pulses
+  and delivered position deltas, and asserts on the WebKit witness timeline
+  that no flush precedes the stability window and exactly one anchored flush
+  follows it; the jam.3 final gap case inserts a delivered-event gap past
+  the plain debounce and asserts the hold survives it — WebKit commits the
+  two deliveries as ONE write after a silent scroll-end, while
+  Chromium/Firefox show the plain-debounce marker already present and both
+  deliveries written immediately (#942 intact, the gate's engine term
+  pinned). The dense-tail case rides a ~1 s pulse stream with one legacy
+  gap mid-way and a late measurement inside the trailing window: no
+  release across the whole tail, ONE merged commit only after signal
+  silence AND backlog stillness (the revision-restart, red under its
+  removal); the preemption case streams wheel-only gestures (the
+  rubber-band shape — untrusted wheels made cancelable, pure signal, and
+  note the gesture re-report keeps the HOLD cleared across such a stream,
+  which is why the fold keys on session not hold) and asserts ZERO writes
+  mid-stream, one flush after it rests (red under removal of either the
+  fold or the deadline slide). `store.spec.ts` guards pin
+  park-through-the-tail, the single settle flush, the settle-arm
+  reset/re-derivation, `$isSettleHeld`'s exact agreement with the park
+  condition, and `$jumpRevision`'s tick-economy (backlog mutations only).
+  Forcing the settle term false reddens the tail cases; gate off reddens
+  gap + dense (chromium inert as control); engine term off reddens the gap
+  case on chromium; session term off reddens the webkit programmatic-step
+  cases (compensation lazy-content scroll-up, react estimator-swap — the
+  #942-era suites that pin plain-debounce release for raw scrollTop
+  steps); fold off reddens the preemption case mid-stream.
 - **P7b (native, tjam):** the packaged macOS A/B that triggered this port
-  must show the deceleration symptom on `v0.53.3-jam.2` at or below the
+  must show the deceleration symptom on `v0.53.3-jam.3` at or below the
   vendored baseline's frequency.
 
 ## 4. `react/Virtualizer.tsx` — cache each rendered row
@@ -154,12 +260,173 @@ Tests: `core/store.spec.ts` (remap + stale-jump suites),
 `react/jam-corrections.browser.spec.tsx` (remap after a prepend, WebKit
 included).
 
+## 7. `core/store.ts` + `core/observer.ts` — batched re-point burst (F8)
+
+Room switching re-points/remounts the list and commits a whole batch of size
+corrections with no gesture at all. Deltas 1–3 key the deferral on the user
+gesture (and, from jam.3, the settle hand-off), so that batch is held by
+nothing — the scroll observer never arms the gesture seam for a remount, and
+each ResizeObserver delivery wrote its correction separately: the visible
+jump on a room switch. Delta 7 batches the non-gesture transaction instead.
+A successful remap (`$remapItems`) arms a **burst** park: the wave's
+corrections are added to the same pendingJump the gesture hold uses, capped
+by delta 2 (an unknown-height backlog is capped whatever fills it), and the
+scroll observer — which owns all the timing so the store stays synchronous —
+re-arms a quiescence window on every store update while the burst is pending
+and dispatches `ACTION_BURST_SETTLED` once the wave goes quiet for the same
+stability constant as the scroll-end debounce — the first arm spans two
+windows, so a frame-lagged first delivery cannot end the transaction before
+its first batch. The backlog then lands as **one anchored commit** through
+the existing single flush path.
+
+Two invariants hold the boundary. Ordinary in-place resizes during scroll
+never carry the burst flag, so they stay on #942's immediate path — the
+vehicle is the remap transaction, not the engine. And a burst release must
+not preempt a live hold: if a WebKit gesture/settle park or a frozen-range
+(smooth-scroll) park still owns the release, `ACTION_BURST_SETTLED` leaves
+the backlog parked and that release commits it once, so a burst landing
+mid-tail or mid-smooth-scroll yields a single write, never two. The reverse
+direction also holds (jam.3, from the independent review): a scroll-end
+timer armed BEFORE a remap can fire while the wave is still landing, and a
+live burst owns its release — scroll-end neither flushes the partial
+backlog nor disarms the burst (its state resets still run, so a live hold
+releases at the position's settle); whichever timer quiesces first, the
+merged backlog commits exactly once. A rejected remap never arms. Consumer
+remounts that REJECT the remap (layout without the seam, estimation active,
+invalid window) keep the consumer's anchor-restore flow — batching belongs
+to the remap vehicle.
+
+Tests: `core/store.spec.ts` (burst batch, engine-agnostic, release-
+precedence + scope guards, and the overlapping-timer ownership cases above)
+and P7a cases in `src/jam-corrections.browser.spec.tsx` (the two-delivery
+burst commits as ONE relative write on every engine; the straddle case
+fires a scroll-end mid-wave through the wrapped-store seam and asserts one
+merged write strictly after the scroll-end marker, after POLLING its row
+precondition — the buffer extension a scroll arms renders a frame late on
+Firefox, which `--retry` launders into a false green; a focused no-retry
+run across engines is what makes mount-timing cases honest).
+Outcome
+assertions are viewport-relative — the no-motion burst compares the anchor against its
+own `before` (no deliberate travel in the window), and the momentum case
+against `before` plus the test's own pulse bookkeeping (no growth term):
+with correction writes recorded but not forwarded, each outcome test turns
+red by the full displacement, which the earlier document-space form,
+invariant to a no-op write, was blind to.
+
+## 8. jam.3 final write-discipline contract — ZW / EDGE-START / CAP / P
+
+The completion commit (on top of the settle-window milestone) freezes the
+fork's write discipline. The mechanics below are established behavior of the
+pinned tip, certified by the deterministic probes listed. What is NOT
+established: the attribution of the owner's specific observed symptoms to
+these mechanisms — that is the leading hypothesis, pending the paired
+native trace (tjam gate G5). Deterministic probes certify fork
+write-discipline; native rubber-band survival under a real trackpad gesture
+is certified only by the owner's native A/B — synthetic events don't.
+
+- **ZW (zero-write windows).** While a user gesture owns the timeline —
+  the gesture flag or the settle hold (no position/wheel signal has been
+  silent for `SETTLE_STABILITY`) — the fork writes no scroll position at
+  all on WebKit: corrections park, their visible consequence applied
+  through the visible-offset range, and the whole backlog commits once at
+  rest through the single flush path. End edges and mid-viewport idle
+  flushes keep their writes exactly as pre-change; only the WHEN changes.
+- **EDGE-START (geometry-only at the start edge).** Supersedes delta 3's
+  scroll-compensated edge release. The guard keys on the CURRENT physical
+  offset, not the corrected target: the re-sync may be written only when
+  `relative + jump > 0` — strictly inside the content. At or past the
+  start edge (current <= 0, elastic negatives included) the correction
+  applies geometry only — offsets and total size update, the scroll
+  position is never written, in gesture and idle states alike — AND the
+  parked debt is CLEARED (`pendingJump = 0`). The invariant is LIVE: the
+  clear rides the READER's own `ACTION_SCROLL` onto the edge — a
+  geometry-only invalidation, no write, no release of the gesture/settle
+  holds — and the settle/burst-quiescence flush path keeps the same clear
+  as the BACKSTOP for positions that never transit a scroll event at the
+  edge (programmatic sets, burst-only waves, idle-at-edge). The debt's
+  duty is one-shot anchor preservation at the layout change; the free
+  scroll to the edge voids it, and it rides EVERY item offset
+  (`getItemOffset = getOffset - pendingJump`), so retaining it even
+  briefly — settle-lagged — displaces the whole list: a blank band or
+  clipped first rows with no write at all, through the pre-settle
+  interval. If the anchor re-enters the range, the next measurement
+  re-derives the correction. Keying on the target (`relative + jump +
+pendingJump`) instead let a parked +Δ write +Δ from the edge — clipping
+  the first row — and wrote at native −25 through the elastic stretch;
+  the current-keyed form is the contract. The fork cannot push the
+  scroller into or deeper into the elastic region at the top; that nudge
+  is the mechanism the top band is expected to have come from
+  (hypothesis, G5). The false ceiling delta 3 existed to lift is lifted
+  by the inside-content re-anchor — the same retained write, never a
+  stretch or edge write. The end edge keeps the delta-2-era absolute end
+  clamp unchanged.
+- **CAP (escape at rest).** Delta 2's one-viewport guard remains an
+  ESCAPE threshold, not a per-write limit — when the parked backlog
+  exceeds one viewport it commits ENTIRE, in one write, backlog cleared.
+  The completion adds only the WHEN: mid-gesture the escape defers (the
+  backlog parks whole and lands full-magnitude in the rest write — one
+  larger re-anchor at rest, a stated trade); idle, burst (delta 7) and
+  programmatic escapes fire as before, byte-for-byte. The during-gesture
+  escape that delta 2's shipped guard exercised is filed as deliberate
+  supersession; the guard now pins the idle and burst forms.
+- **P (gesture-ON preemption).** At the observer's gesture-ON seam (the
+  wheel/touch reports that set `gestureSeen`), a pending scroll-end epoch
+  is cancelled and its deadline re-armed: the new gesture owns the
+  timeline; the old timer cannot fire a commit mid-gesture. Motivating red
+  (reviewer probe): a tail with the epoch armed and a fresh wheel-ON ~10 ms
+  before the fire time, no delivered scroll to cancel it — the commit
+  landed mid-flick.
+- **Epoch semantics (explicit non-item).** A correction merging inside an
+  open window rides that window's single at-rest re-sync; its visible
+  consequence is its own reflow at the merge — inherent to any
+  silence-window design. Restarting the window on merge activity was
+  adjudicated against: it would defer only the invisible re-sync and
+  starve it on a continuously measuring list, while risking the write
+  racing motion that the pre-fix flicker was.
+
+Probes (`src/jam-corrections.browser.spec.tsx`, all three engines unless
+noted; unit forms in `src/core/store.spec.ts`):
+
+| Probe                                             | Pins                                                                                                                    |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| (p) fresh wheel-ON preempts the armed epoch       | no scroll-end, no commit at the old fire time; stream rests → one flush; top-edge flick variant: zero writes end to end |
+| (e) gap past the plain debounce inside the window | hold survives; one merged commit, never two                                                                             |
+| (h) corrections netting to zero inside an epoch   | rest flush finds nothing: zero writes                                                                                   |
+| (i) parked backlog + start edge during the tail   | zero writes at the edge in BOTH states, geometry changed, position user-owned, first row unclipped                      |
+| (i, parity) same backlog, rest INSIDE the content | one relative re-anchor, whole, anchor still — the retained write probed where it lives                                  |
+| (ii-a/ii-b) elastic stretch pass-through          | no fork spacer/translation, no write; rows at true offset − native position, geometry == truth                          |
+| (iv) absolute-end regression (unmodified)         | idle bottom-pinned growth above: exactly one anchored write, rows still — the retained behavior                         |
+| (v) end edge during a gesture                     | WebKit parks and keeps the position; one end-clamped commit at rest; #942 engines unchanged                             |
+| reviewer backlog probe (±60 carried to native 0)  | never written at the edge, both states, both signs; rows at true offsets — unit forms: edge-park + elastic guards       |
+| reviewer elastic probe (−25 → 0 with backlog)     | zero writes at every native position; spring-back keeps position and geometry truthful                                  |
+
+Supersession filings in the completion commit's test diff: delta 3's
+scroll-level edge-release guards → start-edge geometry-only forms (delta 2
+and 3 sections above carry the banners); the delta-2 cap guard's
+during-gesture escape → idle/burst forms; the delta-6 frozen-range guard's
+release point → the burst's quiescence (delta 7 owns that release).
+
+The completion commit also withdraws one condition its predecessor shipped
+with: the static-backlog (revision-restart) third gate term was removed
+after tracing the parking machinery — parked corrections are already
+visually applied, and the flush is an invisible re-sync, so a late
+correction parks invisibly and re-syncs on the next scroll without a second
+visible write. The milestone commit's message documents the term as shipped
+there; §8 is the contract of record.
+
+One release-rule change rides with EDGE-START: scroll-end flushes the
+backlog at idle direction too (probe (v)'s shape — a gesture that releases
+without a delivered position must still commit what it parked; pre-ZW a
+backlog could only exist inside a moving session, which is why upstream's
+direction gate was safe there and is not here). A live burst remains the
+sole deferral (R1).
+
 ## Automation — `jam-rebase-patch.yml`, `jam-release.yml`
 
 - **`jam-rebase-patch.yml`** (weekly + dispatch): fetch upstream tags, newest
   semver tag, replay the fork-only commits (`HEAD --not --remotes=upstream`)
   onto it as `jam-<X.Y.Z>`, then `npm ci`, `npx playwright install
-  --with-deps`, `npm run tsc`, `npm test`, `npm run test:browser`. A clean run
+--with-deps`, `npm run tsc`, `npm test`, `npm run test:browser`. A clean run
   means the upgrade branch is ready before anyone needs it; red means upstream
   drifted under a delta — resolve by hand, not mid-upgrade. Fork-only commits
   are derived, never stored as files, so the replay cannot drift from the
@@ -171,7 +438,11 @@ included).
   `virtua-<ver>-jam.<n>.tgz` to the GitHub Release for the tag, printing its
   sha512. A red test step produces no release. The release runner provisions
   its own browsers. Releases are immutable: a bad one is superseded by a new
-  `-jam.<n>` tag, never replaced in place.
+  `-jam.<n>` tag, never replaced in place. Tags may be lightweight or
+  annotated (`v0.53.3-jam.1` is lightweight, `v0.53.3-jam.2` annotated), so
+  consumers verify `fork_commit` against the PEELed tag (`gh api
+repos/thenvoi/virtua/git/tags/<obj-sha>` for annotated refs), never the raw
+  `refs/tags` object.
 - **`check.yml`** (upstream's workflow, one-line fork delta): added
   `workflow_dispatch` so the full gate — tsc, unit, `test:browser --retry=2`
   across Chromium/Firefox/WebKit — can run on a `jam-<ver>` branch, which is
@@ -185,4 +456,4 @@ included).
   all 17 bundles grew; upstream's numbers were never re-baselined on the fork
   because `check.yml` first ran on a `jam-<ver>` branch on 2026-10-08. On a
   rebase where growth shifts, re-measure with `npm run build && npm run
-  size` and bump, never delete an entry.
+size` and bump, never delete an entry.

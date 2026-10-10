@@ -2,6 +2,7 @@ import {
   getCurrentDocument,
   getCurrentWindow,
   isIOSWebKit,
+  isWebKit,
 } from "./environment.js";
 import {
   ACTION_SCROLL,
@@ -11,9 +12,38 @@ import {
   ACTION_USER_GESTURE,
   ACTION_MANUAL_SCROLL,
   ACTION_BEFORE_MANUAL_SMOOTH_SCROLL,
+  ACTION_BURST_SETTLED,
   UPDATE_SIZE_EVENT,
+  UPDATE_VIRTUAL_STATE,
 } from "./store.js";
 import { cancelTimeout, microtask, timeout } from "./utils.js";
+
+/**
+ * The scroll-end debounce: milliseconds of scroll-event silence after which
+ * the position counts as stable. Fork delta 1 (jam.3 revision) also uses it
+ * as the momentum-tail stability window — "settled" and "scroll ended" are
+ * deliberately the same event, so a parked backlog has exactly one release
+ * path (FORK-CHANGES.md delta 1).
+ * @internal
+ */
+export const SCROLL_END_DEBOUNCE = 150;
+
+/**
+ * @internal
+ * Fork delta 1 (jam.3 final, event-driven): the position-silence window the
+ * observer waits before a settle-held release may flush on WebKit. A
+ * momentum tail whose DELIVERED events gap past the plain debounce used to
+ * fire scroll-end mid-tail: the hold released and stragglers wrote per-row
+ * (the owner report's ~50px residual), and a flush landing while the user
+ * began his next gesture ate the native rubber-band (face three). The held
+ * release now waits SETTLE_STABILITY of signal silence — SCROLL OR WHEEL,
+ * each sliding the deadline, no fixed total budget; a correction merging
+ * inside the window rides its single at-rest re-sync (epoch semantics).
+ * The flush lands ~window after the LAST signal. Gapless sessions pay only
+ * the extra silence on their single merged commit; SCROLL_END_DEBOUNCE
+ * itself and its other consumers are untouched.
+ */
+export const SETTLE_STABILITY = 300;
 
 /**
  * @internal
@@ -58,8 +88,48 @@ export const createScrollObserver = (
   let justTouchEnded = false;
   let stillMomentumScrolling = false;
   let cancelScroll: (() => void) | undefined;
+  // Fork delta 1 (jam.3 final, event-driven): the last signal — a delivered
+  // scroll delta or a wheel pulse while the hold is active. The held
+  // release waits for SETTLE_STABILITY of signal silence; every signal
+  // slides the deadline, so a 1 s+ tail stays held and settles ~window
+  // after its LAST event — no fixed total budget.
+  let settleSignal = 0;
+  // Set while a user gesture has been reported since the last scroll-end.
+  // The hold arm keys on movement alone (a raw programmatic scrollTop step
+  // releases into it too, pre-fix same-tick and therefore invisible); the
+  // extension belongs to USER tails only — programmatic scrolls keep #942's
+  // plain-debounce release timing exactly.
+  let gestureSeen = false;
 
   let scrollEndTimer: ReturnType<typeof timeout> | undefined;
+  // Fork delta 7: this observer owns the burst-window timing so the store
+  // stays synchronous. The FIRST arm after a transaction spans TWO
+  // stability windows: the wave's first ResizeObserver delivery can lag the
+  // remap by a frame or more under load, and a window that elapsed before
+  // any correction had parked would end the transaction before its first
+  // batch. Once the wave is running, each update re-arms ONE window, so the
+  // commit lands one stability window — the scroll-end debounce constant —
+  // after the LAST correction (FORK-CHANGES.md delta 7).
+  let burstEndTimer: ReturnType<typeof timeout> | undefined;
+  let burstWaveStarted = false;
+
+  const armBurstWindow = () => {
+    cancelTimeout(burstEndTimer);
+    burstEndTimer = timeout(
+      () => {
+        burstWaveStarted = false;
+        store.$update(ACTION_BURST_SETTLED);
+      },
+      burstWaveStarted ? SCROLL_END_DEBOUNCE : SCROLL_END_DEBOUNCE * 2,
+    );
+    burstWaveStarted = true;
+  };
+  // Arm once on the remap's async notify, then on each wave update until it
+  // goes quiet. While no burst is pending the callback does nothing, so an
+  // ordinary scroll never schedules a spurious commit.
+  const unsubscribeBurst = store.$subscribe(UPDATE_VIRTUAL_STATE, () => {
+    if (store.$isBurstPending()) armBurstWindow();
+  });
 
   const now = Date.now;
   const scrollOffsetKey = isHorizontal ? "scrollLeft" : "scrollTop";
@@ -103,17 +173,39 @@ export const createScrollObserver = (
     }
 
     justTouchEnded = false;
-
     store.$update(ACTION_USER_GESTURE, false);
+    // Fork delta 1 (jam.3 final, event-driven): released into a still-moving
+    // position — the settle hold owns the release. The flush waits for
+    // SETTLE_STABILITY of signal silence (scroll OR wheel — the stream is
+    // the hand-on-glass condition: a rubber-band flick keeps sliding the
+    // deadline instead of eating the spring-back under a scheduled write).
+    // No fixed budget — the deadline rides the last signal; a correction
+    // merging inside the window rides its single at-rest re-sync (accepted
+    // epoch semantics — compensating mid-window would race the tail).
+    // Non-WebKit engines, programmatic sessions (gestureSeen) and marked
+    // imperative operations (the accessor's mode term) never enter this
+    // branch; their release stays the plain debounce, per #942.
+    if (isWebKit() && gestureSeen && store.$isSettleHeld()) {
+      const silent = now() - settleSignal;
+      if (silent < SETTLE_STABILITY) {
+        scrollEndTimer = timeout(onScrollEnd, SETTLE_STABILITY - silent);
+        return;
+      }
+    }
     store.$update(ACTION_SCROLL_END);
+    gestureSeen = false;
   };
   const scheduleScrollEnd = () => {
     cancelTimeout(scrollEndTimer);
-    scrollEndTimer = timeout(onScrollEnd, 150);
+    scrollEndTimer = timeout(onScrollEnd, SCROLL_END_DEBOUNCE);
   };
 
   const onScroll = () => {
     lastScrollTime = now();
+    // A delivered delta slides the stability deadline — the window is
+    // measured from the LAST signal, corrections merging inside it ride
+    // the single at-rest re-sync.
+    settleSignal = now();
 
     if (justTouchEnded) {
       stillMomentumScrolling = true;
@@ -126,16 +218,43 @@ export const createScrollObserver = (
 
     scheduleScrollEnd();
   };
-
   // Infer scroll state also from wheel events
   // Sometimes scroll events do not fire when frame dropped even if the visual have been already scrolled
   const onWheel = ((e: WheelEvent) => {
     // Fork delta 1 seam: report user-gesture activity to the store before
     // any inference filtering. A wheel on this viewport during scrolling is
     // exactly the moment WKWebView reverts written positions; ctrlKey is
-    // the pinch-zoom gesture, which does not scroll.
-    if (!e.ctrlKey && store.$isScrolling()) {
+    // the pinch-zoom gesture, which does not scroll. Delta 1's jam.3
+    // revision also treats a wheel pulse within the stability window after
+    // the last delivered scroll position as user activity on WebKit: on a
+    // 120Hz display with dropped frames the tail can outrun a debounce gap,
+    // momentarily ending the scroll while deceleration continues — and
+    // programmatic scrolls never dispatch wheel events, so #942's
+    // immediate writes are untouched. The hold cannot stick: it is bounded
+    // by the scroll-end timer that last scroll event armed.
+    if (
+      !e.ctrlKey &&
+      (store.$isScrolling() ||
+        (isWebKit() && now() - lastScrollTime < SCROLL_END_DEBOUNCE))
+    ) {
       store.$update(ACTION_USER_GESTURE, true);
+      gestureSeen = true;
+      // (P) same preemption at the wheel report; the fold-in below covers
+      // the still-scrolling case, this covers a live timer with direction
+      // already idle.
+      settleSignal = now();
+      if (scrollEndTimer !== undefined) scheduleScrollEnd();
+    }
+    // Fork delta 1 (jam.3 final): the wheel stream folds into the stability
+    // re-arm for the WHOLE user session — during a gesture the re-report
+    // above hands the park to the gesture flag (clearing the hold term), so
+    // keying the fold on the hold alone would miss exactly the gappy streams
+    // it exists for. gestureSeen (not isScrolling's raw direction) keeps
+    // programmatic sessions out; a pulse IS the signal that the session
+    // continues, sliding the deadline of the eventual held release.
+    if (isWebKit() && !e.ctrlKey && gestureSeen && store.$isScrolling()) {
+      settleSignal = now();
+      scheduleScrollEnd();
     }
     if (
       wheeling ||
@@ -164,6 +283,13 @@ export const createScrollObserver = (
   const onTouchStart = () => {
     touching = true;
     store.$update(ACTION_USER_GESTURE, true);
+    gestureSeen = true;
+    // jam.3 final contract (P): a gesture re-engaging while a scroll-end
+    // epoch is pending takes the timeline over — the old timer must not
+    // fire a commit mid-gesture; this gesture's deliveries restart epochs
+    // and its release re-arms the hold.
+    settleSignal = now();
+    if (scrollEndTimer !== undefined) scheduleScrollEnd();
     justTouchEnded = stillMomentumScrolling = false;
   };
   const onTouchEnd = () => {
@@ -191,6 +317,8 @@ export const createScrollObserver = (
       viewport.removeEventListener("touchstart", onTouchStart);
       viewport.removeEventListener("touchend", onTouchEnd);
       cancelTimeout(scrollEndTimer);
+      unsubscribeBurst();
+      cancelTimeout(burstEndTimer);
     },
     _fixScrollJump: () => {
       const [jump, shift] = store._flushJump();

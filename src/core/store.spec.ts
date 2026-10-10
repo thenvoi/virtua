@@ -7,9 +7,11 @@ import {
   ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
   ACTION_ITEMS_LENGTH_CHANGE,
   ACTION_MANUAL_SCROLL,
+  ACTION_RELAYOUT,
   ACTION_SCROLL,
   ACTION_SCROLL_END,
   ACTION_USER_GESTURE,
+  ACTION_BURST_SETTLED,
   ACTION_VIEWPORT_RESIZE,
   createVirtualStore,
   UPDATE_VIRTUAL_STATE,
@@ -307,12 +309,15 @@ describe("virtual store item remapping (FORK-CHANGES.md delta 6)", () => {
       true,
     );
     expect(store.$getRange(0)[1]).toBeLessThan(3);
-
-    // A delivered scroll at the start edge releases the backlog mid-gesture
-    // (delta 3); scroll end (upstream's release) then finds nothing left —
-    // the preserved pendingJump arrives to the reader unchanged either way.
+    // The remap armed a burst wave (delta 7), so the wave — not scroll-end
+    // — owns the release (R1): scroll-end defers, and the wave's quiescence
+    // (BURST_SETTLED) commits the preserved pendingJump once, whole. In a real
+    // browser the quiescence is the measurement storm settling a beat after
+    // scroll-end; delta 3's scroll-level edge trigger is gone (EDGE-START
+    // supersedes it), so no mid-scroll write precedes the commit anymore.
     store.$update(ACTION_SCROLL, 1);
     store.$update(ACTION_SCROLL_END);
+    store.$update(ACTION_BURST_SETTLED);
     expect(store._flushJump()).toEqual([5, false]);
   });
 });
@@ -508,7 +513,7 @@ describe("WebKit mid-gesture deferral (FORK-CHANGES.md deltas 1–3)", () => {
     vi.resetModules();
   });
 
-  it("applies a parked backlog above one viewport through the gesture instead of parking it (delta 2)", () => {
+  it("parks a backlog above one viewport through the gesture and commits whole at rest (delta 2 supersession)", () => {
     webkitFlag.value = true;
     const store = storeWith(6, 16);
     store.$update(ACTION_VIEWPORT_RESIZE, 50);
@@ -521,14 +526,15 @@ describe("WebKit mid-gesture deferral (FORK-CHANGES.md deltas 1–3)", () => {
     store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
       index === 1 ? 100 : 30,
     );
-    // Delta 1 alone would park all of it until scroll end; the cap writes
-    // the backlog through immediately, so gesture end releases nothing more.
-    expect(store._flushJump()).toEqual([70, false]);
+    // The mid-gesture cap escape is superseded by ZW (contract CAP): the
+    // backlog keeps parking during the gesture and commits once, whole,
+    // at scroll end — one larger re-anchor at rest, the stated trade.
+    expect(store._flushJump()).toEqual([0, false]); // parked, nothing through
     store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()[0]).toBe(70); // whole, at rest
     expect(store._flushJump()).toEqual([0, false]);
   });
-
-  it("releases a parked backlog at the start edge mid-gesture, before scroll end (delta 3)", () => {
+  it("keeps the backlog parked at the start edge during the gesture, one commit at rest (delta 3 supersession)", () => {
     webkitFlag.value = true;
     const store = storeWith(6, 16);
     store.$update(ACTION_VIEWPORT_RESIZE, 50);
@@ -543,11 +549,14 @@ describe("WebKit mid-gesture deferral (FORK-CHANGES.md deltas 1–3)", () => {
     );
     expect(store._flushJump()).toEqual([0, false]); // parked (delta 1)
 
-    // A delivered scroll near the start edge — the false-ceiling moment —
-    // releases the backlog without waiting for the gesture to end.
+    // A delivered scroll near the start edge: the old delta-3 release
+    // fired a compensating WRITE here, mid-gesture. Under EDGE-START +
+    // ZW nothing is written while the hand is on glass; the geometry
+    // stays truthful through the visible-offset machinery.
     store.$update(ACTION_SCROLL, 5);
-    expect(store._flushJump()).toEqual([20, false]);
-    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]);
+    store.$update(ACTION_SCROLL_END); // at rest…
+    expect(store._flushJump()[0]).toBe(20); // …one commit, current > 0
     expect(store._flushJump()).toEqual([0, false]);
   });
 
@@ -565,11 +574,493 @@ describe("WebKit mid-gesture deferral (FORK-CHANGES.md deltas 1–3)", () => {
     );
     expect(store._flushJump()).toEqual([0, false]); // parked (delta 1)
 
-    // Mid-page scroll (payload beyond one viewport from the start): the
-    // release must NOT fire — it is start-edge only, no direction test.
+    // A delivered scroll never triggers a flush on its own (delta 3's
+    // scroll-level trigger is gone); the backlog releases at scroll end.
     store.$update(ACTION_SCROLL, 300);
     expect(store._flushJump()).toEqual([0, false]);
     store.$update(ACTION_SCROLL_END);
     expect(store._flushJump()).toEqual([20, false]);
+  });
+
+  it("clears a parked shrink at the start edge — no write, offsets returned to true geometry (EDGE-START clear)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5); // prime estimates; anchor resolves at index 5
+    store._flushJump();
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_USER_GESTURE, true);
+    // Row 1 SHRINKS 30 → 10: a −20 correction parks (sign per the
+    // reviewer's fixture: shrink is the negative pendingJump). While
+    // parked it rides EVERY item offset (getItemOffset = getOffset −
+    // pendingJump): row 0 — nothing above it — would render 20px BELOW
+    // the top, a fork-injected blank band, even with no scroll write.
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 10 : 30,
+    );
+    expect(store._flushJump()).toEqual([0, false]); // −20 parked (delta 1)
+
+    // The reader moves AT the start edge while the epoch is open; the
+    // flush finds current ≤ 0: NO write (a target-keyed guard would have
+    // written −20 from 0) AND the debt is CLEARED — one-shot anchor
+    // preservation, stale once the position is the reader's own.
+    store.$update(ACTION_SCROLL, 0);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]); // no write, ever
+    // The offset channel is true geometry: row 0's rendered offset equals
+    // its raw layout offset (retention would leave it at +20 — the band).
+    expect(store.$getItemOffset(0)).toBe(0);
+    expect(
+      store.$getVisibleOffset() -
+        (store.$getScrollOffset() - store.$getStartSpacerSize()),
+    ).toBe(0);
+
+    // Nothing deferred to later: the debt was one-shot. Later flushes,
+    // inside the content included, find no backlog to commit.
+    store.$update(ACTION_SCROLL, 10);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+
+  it("clears a parked growth through the elastic clock — no write at any native position, offsets true (EDGE-START clear)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5);
+    store._flushJump();
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_USER_GESTURE, true);
+    // +20 GROWTH (the positive sign): retention at the edge clips row 0
+    // to −20 through the offset channel; the target-keyed guard also
+    // WROTE it from −25 (−25 + 20 = "room").
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
+    );
+    store.$update(ACTION_SCROLL, -25); // the stretched position
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]); // no write AT elastic
+    store.$update(ACTION_SCROLL, 0); // spring-back
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]); // no write AT the edge
+    // Cleared both encounters: true geometry, nothing deferred.
+    expect(store.$getItemOffset(0)).toBe(0); // retention: −20 (clipped row)
+    expect(
+      store.$getVisibleOffset() -
+        (store.$getScrollOffset() - store.$getStartSpacerSize()),
+    ).toBe(0);
+    store.$update(ACTION_SCROLL, 5);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]); // one-shot, no ghost commit
+  });
+
+  it("clears the parked debt LIVE at edge-reach — true offsets before any settle flush, holds intact (EDGE-START live)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5);
+    store._flushJump();
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_USER_GESTURE, true);
+    // −20 shrink parked mid-list while the gesture hold is open.
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 10 : 30,
+    );
+    expect(store._flushJump()).toEqual([0, false]); // parked (delta 1)
+
+    // The reader's SCROLL EVENT onto the edge is where the invariant
+    // becomes due — not the settle flush that follows it. Pre-settle,
+    // while the hold still governs: NO write (ZW absolute, and the
+    // edge-reach clear is geometry-only) and the offset channel already
+    // TRUE (a settle-lagged clear leaves row0 at +20 through this whole
+    // interval — the reviewer's measured B gap).
+    store.$update(ACTION_SCROLL, 0);
+    expect(store._flushJump()).toEqual([0, false]); // no write on the event
+    expect(store.$getItemOffset(0)).toBe(0); // row0 true BEFORE settle
+
+    // The hold was NOT released by the clear: the epoch still governs the
+    // timeline, and its flush now finds an empty backlog — the
+    // flush-site clear is the backstop, nothing left to clear.
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]);
+    // And nothing was deferred: the debt was one-shot at edge-reach.
+    store.$update(ACTION_SCROLL, 10);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+});
+
+describe("every correction source parks mid-gesture (F7 guard coverage)", () => {
+  // The F7 write-path audit: 0.53.3 routes all four size-correction sources
+  // (resize batch, estimator swap, shift length-change, relayout) through
+  // applyJump, which is the single park gate for BOTH the relative mid-range
+  // and the absolute edge write branch in the observer. Each source gets one
+  // case asserting the write stays parked while the user gesture is active
+  // and releases exactly once at gesture end — the deterministic red that
+  // fires in fork CI if a future refactor lets any source bypass the gate.
+  const midGesture = (store: VirtualStore) => {
+    webkitFlag.value = true;
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    store.$update(ACTION_USER_GESTURE, true);
+  };
+
+  it("resizes batch during a gesture park the whole batch", () => {
+    const store = storeWith(10, 30);
+    midGesture(store);
+    store._flushJump();
+    store.$update(ACTION_ITEM_RESIZE, [
+      [2, 60],
+      [3, 60],
+      [4, 60],
+      [5, 60],
+    ]);
+    expect(store._flushJump()).toEqual([0, false]);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()[0]).toBeGreaterThan(0); // released once, at end
+    expect(store._flushJump()[0]).toBe(0);
+  });
+
+  it("estimator swap during a gesture parks (delta 5 routes through the gate)", () => {
+    const store = storeWith(6, 16);
+    store.$update(ACTION_VIEWPORT_RESIZE, 50);
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, () => 30);
+    store.$getItemOffset(5);
+    store._flushJump();
+    store.$update(ACTION_SCROLL, 200);
+    store.$update(ACTION_USER_GESTURE, true);
+    webkitFlag.value = true;
+    store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, (index: number) =>
+      index === 1 ? 50 : 30,
+    );
+    expect(store._flushJump()).toEqual([0, false]);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([20, false]);
+  });
+
+  it("shift length-change during a gesture parks (prepend-measure interleaving)", () => {
+    const store = storeWith(10, 30);
+    midGesture(store);
+    store._flushJump();
+    store.$update(ACTION_ITEMS_LENGTH_CHANGE, [14, true]);
+    // Parked (jump 0) but already reporting shift mode — the transaction is
+    // in flight; only the WRITE waits.
+    expect(store._flushJump()).toEqual([0, true]);
+    store.$update(ACTION_SCROLL_END);
+    // Gesture end resets the mode before the merge lands, so the release
+    // carries shift=false — the #357 cancel applies to corrections dispatched
+    // DURING a shift transaction, not to the scroll-end backlog.
+    expect(store._flushJump()).toEqual([120, false]);
+  });
+
+  it("relayout jump during a gesture parks", () => {
+    const store = storeWith(10, 30);
+    midGesture(store);
+    store._flushJump();
+    store.$update(ACTION_RELAYOUT, 25);
+    expect(store._flushJump()).toEqual([0, false]);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([25, false]);
+  });
+});
+
+describe("settle-keyed hold past gesture end (FORK-CHANGES.md delta 1, jam.3 revision)", () => {
+  // The jam.3 seam: on WebKit the hold spans the momentum tail, not just the
+  // gesture. The observer's wheel/touch seam reports the gesture; when it
+  // ends while the scroll position is still changing (touch lift-off, wheel
+  // pulses stopping before deceleration does), the store re-keys the hold on
+  // settle state and releases it once, at the observer's scroll-end — the
+  // 150ms position-stability debounce (FORK-CHANGES.md delta 1).
+  const midTail = (store: VirtualStore) => {
+    webkitFlag.value = true;
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300); // position moving: direction != IDLE
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_USER_GESTURE, false); // released mid-tail
+  };
+
+  it("parks a correction delivered after the gesture released, until the position settles (delta 1 revision)", () => {
+    const store = storeWith(10, 30);
+    midTail(store);
+    store._flushJump();
+    // Rows the deceleration reveals measure mid-tail: jam.2 would write this
+    // +25 through (hold gone at gesture end) and WKWebView would revert it —
+    // the one-frame drop-and-return. jam.3 parks it.
+    store.$update(ACTION_RELAYOUT, 25);
+    expect(store._flushJump()).toEqual([0, false]); // parked through the tail
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([25, false]); // one flush at settle
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+
+  it("releases the whole tail backlog exactly once, as a single anchored commit (delta 1 revision)", () => {
+    const store = storeWith(10, 30);
+    midTail(store);
+    store._flushJump();
+    store.$update(ACTION_RELAYOUT, 10); // revealed early: parked
+    store.$update(ACTION_SCROLL, 500); // tail keeps moving (off the start edge)
+    store.$update(ACTION_RELAYOUT, 20); // revealed mid-tail: parked
+    store.$update(ACTION_SCROLL, 650);
+    store.$update(ACTION_RELAYOUT, 5); // revealed late: parked
+    expect(store._flushJump()).toEqual([0, false]); // three corrections, zero writes
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([35, false]); // one merged commit
+    expect(store._flushJump()).toEqual([0, false]); // and nothing more
+  });
+
+  it("a gesture released with the position stable does not arm the settle hold (delta 1 revision scope)", () => {
+    const store = storeWith(10, 30);
+    webkitFlag.value = true;
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_USER_GESTURE, false); // armed: still moving
+    store.$update(ACTION_SCROLL_END); // settled: hold and arm both released
+    store._flushJump();
+    // A later stroke that ends after its scroll-end (direction IDLE at
+    // release) must not re-arm — #942's immediate writes govern a stable
+    // position, and no stale settle arm may survive the release.
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_USER_GESTURE, false);
+    store.$update(ACTION_RELAYOUT, 25);
+    expect(store._flushJump()).toEqual([25, false]);
+  });
+
+  it("the settle-window seam reads the hold exactly where the park condition does (jam.3 final)", () => {
+    // The observer's re-arm decision must not drift from the park semantics:
+    // it extends only while a hold parks (armed AND native mode). False
+    // under a marked imperative mode (#942 owns that release), false for a
+    // release of a stable position, false after scroll-end — an accessor
+    // leaking any of these would delay manual/smooth releases (P4's
+    // scroll-to specs pin those timelines).
+    const store = storeWith(10, 30);
+    webkitFlag.value = true;
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_USER_GESTURE, false);
+    expect(store.$isSettleHeld()).toBe(true); // armed mid-tail: hold parks
+    store.$update(ACTION_MANUAL_SCROLL); // imperative operation now owns it
+    expect(store.$isSettleHeld()).toBe(false);
+    store.$update(ACTION_SCROLL_END);
+    expect(store.$isSettleHeld()).toBe(false); // released, no stale arm
+    store.$update(ACTION_SCROLL, 500);
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_USER_GESTURE, false); // re-armed, native mode
+    expect(store.$isSettleHeld()).toBe(true);
+    store.$update(ACTION_SCROLL_END);
+    expect(store.$isSettleHeld()).toBe(false);
+  });
+
+  it("keeps the tail backlog parked at the start edge, one commit at rest (delta 3 supersession, EDGE-START)", () => {
+    const store = storeWith(10, 30);
+    midTail(store);
+    store._flushJump();
+    store.$update(ACTION_RELAYOUT, 25);
+    expect(store._flushJump()).toEqual([0, false]); // parked (delta 1 revision)
+    // The false-ceiling release during the tail is retired: EDGE-START
+    // geometry-only spans both states, and the visible-offset machinery
+    // keeps the range truthful while parked. The commit lands once, at
+    // rest, with room below the edge.
+    store.$update(ACTION_SCROLL, 5);
+    expect(store._flushJump()).toEqual([0, false]);
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()[0]).toBe(25);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+
+  it("defers the one-viewport cap escape through the tail and commits whole at rest (delta 2 supersession, CAP)", () => {
+    const store = storeWith(10, 30);
+    midTail(store);
+    store._flushJump();
+    // 1.5 viewports parked DURING the settle hand-off: ZW wins over the
+    // escape — the backlog keeps parking and commits once, whole, after
+    // the tail (deliberate supersession of the mid-hold escape; the
+    // retained programmatic/burst escape is guarded in the burst block).
+    store.$update(ACTION_RELAYOUT, 600);
+    expect(store._flushJump()).toEqual([0, false]); // parked through the tail
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()[0]).toBe(600); // one full-magnitude commit
+    expect(store._flushJump()).toEqual([0, false]); // backlog cleared
+  });
+
+  it("keeps #942's immediate writes while a marked imperative scroll is in flight during the tail", () => {
+    const store = storeWith(10, 30);
+    midTail(store); // settle armed
+    // A marked imperative operation takes over the release contract (the
+    // manual/smooth machinery is #942's); the settle term must not silently
+    // park its backlog under it.
+    store.$update(ACTION_MANUAL_SCROLL);
+    store._flushJump();
+    store.$update(ACTION_RELAYOUT, 25);
+    expect(store._flushJump()).toEqual([25, false]);
+  });
+});
+
+describe("non-gesture burst batching (FORK-CHANGES.md delta 7)", () => {
+  // A re-point/remount transaction — the room-switch shape — commits a whole
+  // batch of size corrections with no gesture at all. On every engine the
+  // batch lands as ONE anchored commit through the remap-delta machinery,
+  // not per-row writes. Ordinary in-place resizes (no remap armed) stay on
+  // #942's immediate path: the batching is scoped to the transaction.
+  const repoint = (store: VirtualStore) => {
+    store._flushJump();
+    expect(
+      store.$remapItems({ previousLength: 10, order: [...Array(10).keys()] }),
+    ).toBe(true);
+  };
+
+  it("commits a re-point's size batch as one anchored write on a WebKit-classified engine (delta 7)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(10, 30);
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    repoint(store);
+    // The remount/re-point wave: several previously-visible rows re-measure.
+    store.$update(ACTION_ITEM_RESIZE, [
+      [2, 60],
+      [3, 60],
+      [4, 60],
+      [5, 60],
+    ]);
+    expect(store._flushJump()).toEqual([0, false]); // batch parked
+    store.$update(ACTION_BURST_SETTLED); // observer's quiescence window elapsed
+    expect(store._flushJump()[0]).toBeGreaterThan(0); // one anchored commit
+    expect(store._flushJump()).toEqual([0, false]); // and nothing more
+  });
+
+  it("batches the burst on non-WebKit engines too — the vehicle is the remap, not the gesture (delta 7)", () => {
+    webkitFlag.value = false; // Chromium/Firefox
+    const store = storeWith(10, 30);
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    repoint(store);
+    store.$update(ACTION_ITEM_RESIZE, [
+      [2, 60],
+      [3, 60],
+      [4, 60],
+      [5, 60],
+    ]);
+    expect(store._flushJump()).toEqual([0, false]); // parked, engine-agnostic
+    store.$update(ACTION_BURST_SETTLED);
+    expect(store._flushJump()[0]).toBeGreaterThan(0);
+  });
+
+  it("leaves ordinary in-place resizes on #942's immediate path (delta 7 scope)", () => {
+    webkitFlag.value = false;
+    const store = storeWith(10, 30);
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    // NO remap: this is a resize during plain scroll, not a transaction.
+    store.$update(ACTION_ITEM_RESIZE, [
+      [2, 60],
+      [3, 60],
+    ]);
+    expect(store._flushJump()[0]).toBeGreaterThan(0); // written immediately
+  });
+
+  it("does not preempt an active WebKit settle hold — that release owns the one commit (delta 1 x 7)", () => {
+    webkitFlag.value = true;
+    const store = storeWith(10, 30);
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_USER_GESTURE, false); // settle armed mid-tail
+    store._flushJump();
+    store.$remapItems({ previousLength: 10, order: [...Array(10).keys()] });
+    store.$update(ACTION_ITEM_RESIZE, [[2, 60]]);
+    expect(store._flushJump()).toEqual([0, false]); // parked (both holds)
+    store.$update(ACTION_BURST_SETTLED); // burst quiescence must not commit
+    expect(store._flushJump()).toEqual([0, false]); // while the tail holds it
+    store.$update(ACTION_SCROLL_END); // the tail's release commits once
+    expect(store._flushJump()[0]).toBeGreaterThan(0);
+  });
+
+  it("does not arm on a rejected remap — invalid windows keep #942 immediacy (delta 7 scope)", () => {
+    webkitFlag.value = false;
+    const store = storeWith(10, 30);
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    store._flushJump();
+    // order.length mismatch -> rejected, burst must NOT arm.
+    expect(store.$remapItems({ previousLength: 10, order: [0, 1, 2] })).toBe(
+      false,
+    );
+    store.$update(ACTION_ITEM_RESIZE, [[2, 60]]);
+    expect(store._flushJump()[0]).toBeGreaterThan(0); // still immediate
+  });
+
+  it("keeps the cap escape immediate for a gesture-less burst (CAP retained half)", () => {
+    // The ZW suppression of the escape keys on the gesture/settle flags;
+    // a re-point burst with no user session escapes exactly as before —
+    // a >1-viewport wave commits through the transaction (contract CAP,
+    // FORK-CHANGES delta 2).
+    webkitFlag.value = true;
+    const store = storeWith(10, 30);
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300); // no gesture, no hold
+    store._flushJump();
+    expect(
+      store.$remapItems({ previousLength: 10, order: [...Array(10).keys()] }),
+    ).toBe(true);
+    store.$update(ACTION_RELAYOUT, 600); // 1.5 viewports
+    expect(store._flushJump()[0]).toBe(600); // escaped immediately
+    store.$update(ACTION_BURST_SETTLED);
+    expect(store._flushJump()).toEqual([0, false]);
+  });
+});
+
+describe("burst ownership of its release across timers (R1, jam.3)", () => {
+  // A scroll-end timer armed BEFORE a remap can fire mid-wave: the burst's
+  // quiescence window (from its last delivery) extends past the scroll-end.
+  // The live burst must own its release — scroll-end neither flushes the
+  // partial wave nor disarms it — and the merged backlog commits once at
+  // wave quiescence. All orderings yield exactly one write (FORK-CHANGES.md
+  // delta 7).
+  it("a live-wave burst at scroll-end keeps its release; the merged backlog commits once at wave quiescence", () => {
+    const store = storeWith(10, 30);
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    store.$update(ACTION_USER_GESTURE, true);
+    store._flushJump();
+    expect(
+      store.$remapItems({ previousLength: 10, order: [...Array(10).keys()] }),
+    ).toBe(true); // burst armed mid-gesture; scroll-end timer already live
+    store.$update(ACTION_ITEM_RESIZE, [
+      [0, 60],
+      [1, 60],
+      [2, 60],
+    ]); // wave delivery (+90) — parked
+    store.$update(ACTION_SCROLL_END); // fires while the wave is still live
+    expect(store._flushJump()).toEqual([0, false]); // no partial commit
+    store.$update(ACTION_RELAYOUT, 40); // later wave correction (+40)
+    expect(store._flushJump()).toEqual([0, false]); // still parked (burst owns)
+    store.$update(ACTION_BURST_SETTLED); // wave quiescence
+    expect(store._flushJump()).toEqual([130, false]); // one merged commit
+    expect(store._flushJump()).toEqual([0, false]); // and nothing more
+  });
+
+  it("scroll-end's state resets still run while the burst defers its flush", () => {
+    webkitFlag.value = true;
+    const store = storeWith(10, 30);
+    store.$update(ACTION_VIEWPORT_RESIZE, 400);
+    store.$update(ACTION_SCROLL, 300);
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_USER_GESTURE, false); // settle armed (direction != IDLE)
+    store._flushJump();
+    store.$remapItems({ previousLength: 10, order: [...Array(10).keys()] });
+    store.$update(ACTION_RELAYOUT, 30); // parked under hold AND burst
+    store.$update(ACTION_SCROLL_END);
+    expect(store._flushJump()).toEqual([0, false]); // deferred to the burst
+    // The position IS settled now: with the burst flag still live the next
+    // RELAYOUT parks ONLY via the burst term — a hold leak would park it
+    // even after the burst commits, which the tail below rejects.
+    store.$update(ACTION_RELAYOUT, 40);
+    store.$update(ACTION_BURST_SETTLED);
+    expect(store._flushJump()).toEqual([70, false]); // one merged commit
+    store.$update(ACTION_RELAYOUT, 25);
+    expect(store._flushJump()).toEqual([25, false]); // nothing parks after
   });
 });

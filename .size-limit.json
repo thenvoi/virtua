@@ -3,102 +3,102 @@
     "name": "Total",
     "path": "lib/index.js",
     "import": "*",
-    "limit": "9.6 kB"
+    "limit": "9.7 kB"
   },
   {
     "name": "VList",
     "path": "lib/index.js",
     "import": "{ VList }",
-    "limit": "4.42 kB"
+    "limit": "4.54 kB"
   },
   {
     "name": "Virtualizer",
     "path": "lib/index.js",
     "import": "{ Virtualizer }",
-    "limit": "4.32 kB"
+    "limit": "4.43 kB"
   },
   {
     "name": "WindowVirtualizer",
     "path": "lib/index.js",
     "import": "{ WindowVirtualizer }",
-    "limit": "4.1 kB"
+    "limit": "4.22 kB"
   },
   {
     "name": "VGrid",
     "path": "lib/index.js",
     "import": "{ VGrid }",
-    "limit": "6.33 kB"
+    "limit": "6.47 kB"
   },
   {
     "name": "VMasonry",
     "path": "lib/index.js",
     "import": "{ VMasonry }",
-    "limit": "4.02 kB"
+    "limit": "4.14 kB"
   },
   {
     "name": "vue VList",
     "path": "lib/vue/index.js",
     "import": "{ VList }",
-    "limit": "4.58 kB"
+    "limit": "4.71 kB"
   },
   {
     "name": "vue Virtualizer",
     "path": "lib/vue/index.js",
     "import": "{ Virtualizer }",
-    "limit": "4.27 kB"
+    "limit": "4.4 kB"
   },
   {
     "name": "vue WindowVirtualizer",
     "path": "lib/vue/index.js",
     "import": "{ WindowVirtualizer }",
-    "limit": "4.17 kB"
+    "limit": "4.28 kB"
   },
   {
     "name": "vue VGrid",
     "path": "lib/vue/index.js",
     "import": "{ VGrid }",
-    "limit": "6.41 kB"
+    "limit": "6.53 kB"
   },
   {
     "name": "vue VMasonry",
     "path": "lib/vue/index.js",
     "import": "{ VMasonry }",
-    "limit": "4.1 kB"
+    "limit": "4.21 kB"
   },
   {
     "name": "solid VList",
     "path": "lib/solid/index.js",
     "import": "{ VList }",
-    "limit": "4.37 kB"
+    "limit": "4.5 kB"
   },
   {
     "name": "solid Virtualizer",
     "path": "lib/solid/index.js",
     "import": "{ Virtualizer }",
-    "limit": "4.1 kB"
+    "limit": "4.21 kB"
   },
   {
     "name": "solid WindowVirtualizer",
     "path": "lib/solid/index.js",
     "import": "{ WindowVirtualizer }",
-    "limit": "4.1 kB"
+    "limit": "4.23 kB"
   },
   {
     "name": "solid VGrid",
     "path": "lib/solid/index.js",
     "import": "{ VGrid }",
-    "limit": "6.75 kB"
+    "limit": "6.89 kB"
   },
   {
     "name": "solid VMasonry",
     "path": "lib/solid/index.js",
     "import": "{ VMasonry }",
-    "limit": "4.21 kB"
+    "limit": "4.35 kB"
   },
   {
     "name": "angular",
     "path": "lib/angular/index.js",
     "import": "*",
-    "limit": "11.71 kB"
+    "limit": "11.83 kB"
   }
 ]

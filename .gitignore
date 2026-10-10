@@ -6,3 +6,6 @@ node_modules
 /storybook-static/
 .eslintcache
 .angular-dts
+
+# rebuild artifact from a room-clone npm install
+*.install*.log
