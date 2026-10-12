@@ -473,6 +473,51 @@ describe("WebKit mid-gesture deferral (FORK-CHANGES.md deltas 1–3)", () => {
     expect(store._flushJump()).toEqual([20, false]);
   });
 
+  it("keeps upstream's idle manual-scroll end from releasing a frozen-range correction", () => {
+    webkitFlag.value = true;
+    const store = storeWith(100, 20);
+    store.$update(ACTION_VIEWPORT_RESIZE, 100);
+    store.$update(ACTION_MANUAL_SCROLL);
+    store.$update(ACTION_SCROLL, 1000);
+    store.$update(ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, 800);
+    store.$update(ACTION_ITEM_RESIZE, [[0, 30]]);
+    expect(store.$isScrolling()).toBe(false);
+    expect(store._flushJump()).toEqual([0, false]);
+    expect(store.$getItemOffset(40)).toBe(800);
+
+    const onVirtualState = vi.fn();
+    store.$subscribe(UPDATE_VIRTUAL_STATE, onVirtualState);
+    store.$update(ACTION_SCROLL_END);
+
+    // Manual scroll deliveries do not set direction; the next imperative
+    // operation must still see the parked geometry, not a pending write.
+    expect(store._flushJump()).toEqual([0, false]);
+    expect(onVirtualState).not.toHaveBeenCalled();
+    expect(store.$getItemOffset(40)).toBe(800);
+    expect(store.$getRange(0)[0]).toBe(50); // frozen range still clears
+  });
+
+  it("releases a native idle gesture's correction without a delivered position", () => {
+    webkitFlag.value = true;
+    const store = storeWith(100, 20);
+    store.$update(ACTION_VIEWPORT_RESIZE, 100);
+    store.$update(ACTION_MANUAL_SCROLL);
+    store.$update(ACTION_SCROLL, 1000);
+    store.$update(ACTION_SCROLL_END);
+    store.$update(ACTION_USER_GESTURE, true);
+    store.$update(ACTION_ITEM_RESIZE, [[0, 30]]);
+    expect(store.$isScrolling()).toBe(false);
+    expect(store._flushJump()).toEqual([0, false]);
+
+    const onVirtualState = vi.fn();
+    store.$subscribe(UPDATE_VIRTUAL_STATE, onVirtualState);
+    store.$update(ACTION_SCROLL_END);
+
+    expect(store._flushJump()).toEqual([10, false]);
+    expect(store._flushJump()).toEqual([0, false]);
+    expect(onVirtualState).toHaveBeenCalledTimes(1);
+  });
+
   it("classifies engines by user agent: WebKit true; Chrome, Edge, and Firefox false (delta 1)", async () => {
     // isWebKit memoizes per module instance, so each UA gets a fresh import.
     const cases: [string, boolean][] = [

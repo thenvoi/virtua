@@ -427,12 +427,21 @@ correction parks invisibly and re-syncs on the next scroll without a second
 visible write. The milestone commit's message documents the term as shipped
 there; §8 is the contract of record.
 
-One release-rule change rides with EDGE-START: scroll-end flushes the
-backlog at idle direction too (probe (v)'s shape — a gesture that releases
-without a delivered position must still commit what it parked; pre-ZW a
-backlog could only exist inside a moving session, which is why upstream's
-direction gate was safe there and is not here). A live burst remains the
-sole deferral (R1).
+One release-rule change rides with EDGE-START: scroll-end flushes a
+**native-mode** backlog at idle direction too (probe (v)'s shape — a gesture
+that releases without a delivered position must still commit what it
+parked; pre-ZW, native gesture corrections were deferred only during a
+moving session). A live burst remains the sole native-mode deferral (R1).
+
+Marked manual and shift operations retain upstream's direction-gated
+release and virtual-state notification, as required by delta 1's #942
+boundary. Smooth-scroll deliveries deliberately leave direction idle.
+Applying the native idle-release rule to them flushed a frozen-range park
+at END on Linux WebKit; the resulting correction's still-unobserved
+`_flushedJump` made the next smooth call inspect the previous range instead
+of measuring its destination. The upstream reverse-scroll test's exact
+alignment oracle is unchanged; the mode boundary restores its semantics
+without weakening the native zero-motion release or any write discipline.
 
 ## Automation — `jam-rebase-patch.yml`, `jam-release.yml`
 

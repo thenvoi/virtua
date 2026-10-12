@@ -590,21 +590,23 @@ export const createVirtualStore = (
         }
         case ACTION_SCROLL_END: {
           mutated = UPDATE_SCROLL_END_EVENT;
-          // Scroll-end IS the backlog's release point — direction or not.
-          // Upstream keyed the flush on a non-idle direction (before ZW a
-          // parked backlog could only exist inside a MOVING session); the
-          // final contract also parks during a gesture that never delivers
-          // position to the release (probe (v): touch, a measurement above,
-          // lift — the epoch ends at idle direction and MUST still commit).
-          // The conversion below applies EDGE/CAP at the commit. The single
-          // deferral is a LIVE burst (R1, jam.3): a scroll-end timer armed
-          // BEFORE a remap firing mid-wave must neither flush the partial
-          // backlog nor disarm — the merged commit is the wave's quiescence
-          // (ACTION_BURST_SETTLED).
-          if (!_burstPending) {
-            shouldFlushPendingJump = true;
+          // Native scroll-end releases an idle-direction backlog too: ZW
+          // parks even when a gesture delivers no position (probe (v)).
+          // Marked imperative modes retain upstream's direction gate.
+          // Smooth scrolls leave direction idle; releasing their frozen
+          // park here can keep _flushedJump live across the next call and
+          // hide its destination range until the correction scroll lands.
+          if (
+            _scrollDirection !== SCROLL_IDLE ||
+            _scrollMode === SCROLL_BY_NATIVE
+          ) {
+            // A live burst still owns its release: a scroll-end armed
+            // before the remap must not commit a partial wave (R1).
+            if (!_burstPending) {
+              shouldFlushPendingJump = true;
+            }
+            mutated += UPDATE_VIRTUAL_STATE;
           }
-          mutated += UPDATE_VIRTUAL_STATE;
           // State resets stay unconditional: the position HAS settled, so a
           // live gesture/settle hold releases here regardless of the burst
           // (the backlog it parked is the burst's to commit at quiescence).
