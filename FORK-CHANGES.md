@@ -2,8 +2,8 @@
 
 Rev-pinned fork consumed by [thenvoi/tjam](https://github.com/thenvoi/tjam) via a
 GitHub Release tarball URL pinned by sha512 in `pnpm-lock.yaml` (see tjam's
-`apps/desktop/vendor-dependencies.json`). Based on tag `0.53.3`
-(`2d8617e8fcadce63f3eefd37abd89d54e582f6f8`).
+`apps/desktop/vendor-dependencies.json`). Based on tag `0.53.4`
+(`ff861ddf24959976372965f1f4c5421ae7a75135`).
 
 Band previously vendored `virtua@0.50.0` inside tjam (`apps/desktop/src/lib/virtua`,
 commits `5fe3139f9`, `c05b2211e`, `c26229243`). This fork gives those changes a
