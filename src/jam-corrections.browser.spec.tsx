@@ -186,6 +186,15 @@ const onceScroll = (viewport: HTMLElement) => {
   return promise;
 };
 
+// Request rendering opportunities while polling the ResizeObserver-published
+// size. Headless Linux WebKit can otherwise leave a synthetic style resize
+// undelivered until a scroll triggers rendering, after the hold/burst expires.
+// The measured size remains the condition, not a fixed number of frames.
+const measuredSize = async (container: HTMLElement) => {
+  await nextFrame();
+  return parseFloat(container.style.height);
+};
+
 const List = ({
   items,
   shift,
@@ -907,9 +916,7 @@ describe("dense tail with a mid-gap: event-driven hold (jam.3 final, probe a)", 
       .previousElementSibling as HTMLElement | null;
     expect(topAbove).toBeTruthy();
     topAbove!.style.height = `${ROW + 30}px`;
-    await expect
-      .poll(() => parseFloat(container.style.height))
-      .toBe(60 * ROW + 180);
+    await expect.poll(() => measuredSize(container)).toBe(60 * ROW + 180);
     if (webkitEngine) {
       // Parked, not written — the deadline rides the LAST pulse (+300), so
       // the merged commit lands after this check, asserted below.
@@ -1131,16 +1138,12 @@ describe("re-point burst commits once (jam.3 delta 7)", () => {
     // pixel is anchor-relevant.
     const grownA = getItem(container, "row-10") as HTMLElement;
     grownA.style.height = `${ROW + 140}px`;
-    await expect
-      .poll(() => parseFloat(container.style.height))
-      .toBe(30 * ROW + 140);
+    await expect.poll(() => measuredSize(container)).toBe(30 * ROW + 140);
     expect(witness.flushes.filter(([jump]) => jump !== 0).length).toBe(0);
     expect(witness.writes.length).toBe(0);
     const grownB = getItem(container, "row-11") as HTMLElement;
     grownB.style.height = `${ROW + 40}px`;
-    await expect
-      .poll(() => parseFloat(container.style.height))
-      .toBe(30 * ROW + 140 + 40);
+    await expect.poll(() => measuredSize(container)).toBe(30 * ROW + 140 + 40);
     expect(witness.flushes.filter(([jump]) => jump !== 0).length).toBe(0);
     expect(witness.writes.length).toBe(0); // the whole wave parked
     // Quiescence: 150ms after the LAST wave correction lands, the batch
@@ -1231,9 +1234,7 @@ describe("remap during active scroll, scroll-end mid-wave (R1 regression)", () =
     ).toBe(true);
     // Wave delivery 1 lands BEFORE the scroll-end.
     above!.style.height = `${ROW + 10}px`;
-    await expect
-      .poll(() => parseFloat(container.style.height))
-      .toBe(60 * ROW + 10);
+    await expect.poll(() => measuredSize(container)).toBe(60 * ROW + 10);
     // The scroll-end timer fires NOW — mid-wave. It must neither flush the
     // partial backlog nor disarm the burst (its own resets may run).
     seam.update!(ACTION_USER_GESTURE, false);
@@ -1242,18 +1243,12 @@ describe("remap during active scroll, scroll-end mid-wave (R1 regression)", () =
     // Wave deliveries 2-4 land after the scroll-end, inside the burst's
     // still-live quiescence window.
     above!.style.height = `${ROW + 20}px`;
-    await expect
-      .poll(() => parseFloat(container.style.height))
-      .toBe(60 * ROW + 20);
+    await expect.poll(() => measuredSize(container)).toBe(60 * ROW + 20);
     expect(witness.flushes.filter(([jump]) => jump !== 0).length).toBe(0);
     above!.style.height = `${ROW + 30}px`;
-    await expect
-      .poll(() => parseFloat(container.style.height))
-      .toBe(60 * ROW + 30);
+    await expect.poll(() => measuredSize(container)).toBe(60 * ROW + 30);
     above!.style.height = `${ROW + 40}px`;
-    await expect
-      .poll(() => parseFloat(container.style.height))
-      .toBe(60 * ROW + 40);
+    await expect.poll(() => measuredSize(container)).toBe(60 * ROW + 40);
     // The wave's own quiescence commits the merged backlog — once.
     await expect
       .poll(() => witness.flushes.filter(([jump]) => jump !== 0).length)
@@ -2032,9 +2027,7 @@ describe("start-edge geometry-only and gesture preemption (jam.3 final contract 
     const grown = anchor.previousElementSibling as HTMLElement | null;
     expect(grown).toBeTruthy();
     grown!.style.height = `${2 * ROW + 50}px`;
-    await expect
-      .poll(() => parseFloat(container.style.height))
-      .toBe(60 * ROW + 150);
+    await expect.poll(() => measuredSize(container)).toBe(60 * ROW + 150);
     if (!isWebkit()) {
       await expect
         .poll(() => witness.flushes.filter(([jump]) => jump !== 0).length)
@@ -2056,7 +2049,7 @@ describe("start-edge geometry-only and gesture preemption (jam.3 final contract 
     await delay(120);
     await wheel();
     grown!.style.height = `${ROW}px`;
-    await expect.poll(() => parseFloat(container.style.height)).toBe(60 * ROW);
+    await expect.poll(() => measuredSize(container)).toBe(60 * ROW);
     for (let k = 0; k < 3; k++) {
       await delay(80);
       await wheel();

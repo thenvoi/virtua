@@ -404,6 +404,15 @@ noted; unit forms in `src/core/store.spec.ts`):
 | reviewer backlog probe (±60 carried to native 0)  | never written at the edge, both states, both signs; rows at true offsets — unit forms: edge-park + elastic guards       |
 | reviewer elastic probe (−25 → 0 with backlog)     | zero writes at every native position; spring-back keeps position and geometry truthful                                  |
 
+Browser driving on Linux WebKit: the dense-tail late measurement, both
+burst-wave cases, and zero-net epoch probe request animation frames while
+polling the ResizeObserver-published total size. Timer-only reads of inline
+styles can leave a synthetic resize undelivered on headless WPE/GTK until a
+scroll triggers rendering, letting the real 150/300 ms release timers expire
+before that delivery. The poll still waits for the actual measured size; it
+does not change the product timers, inject extra scroll/gesture signals, or
+relax the zero-write and single-flush assertions.
+
 Supersession filings in the completion commit's test diff: delta 3's
 scroll-level edge-release guards → start-edge geometry-only forms (delta 2
 and 3 sections above carry the banners); the delta-2 cap guard's
