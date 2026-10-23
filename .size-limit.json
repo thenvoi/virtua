@@ -3,13 +3,13 @@
     "name": "Total",
     "path": "lib/index.js",
     "import": "*",
-    "limit": "9.7 kB"
+    "limit": "9.82 kB"
   },
   {
     "name": "VList",
     "path": "lib/index.js",
     "import": "{ VList }",
-    "limit": "4.54 kB"
+    "limit": "4.82 kB"
   },
   {
     "name": "Virtualizer",

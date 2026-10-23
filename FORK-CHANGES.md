@@ -443,6 +443,25 @@ of measuring its destination. The upstream reverse-scroll test's exact
 alignment oracle is unchanged; the mode boundary restores its semantics
 without weakening the native zero-motion release or any write discipline.
 
+## 9. `react/VList.tsx` — keyboard-scrollable, focusable viewport
+
+Native keyboard scrolling follows the focused element. In a virtualized list
+the row a reader focused can unmount while they scroll, and the keys then stop
+moving the list. `VList` therefore makes its own viewport focusable
+(`tabIndex` defaults to `0`) and scrolls it for ArrowUp/ArrowDown (40 px),
+PageUp/PageDown and Space/Shift+Space (80% of the viewport height, at least
+40 px), Home, and End. It handles a key only when the viewport itself is the
+event target and the caller's `onKeyDown` did not call `preventDefault`, so
+focused rows and caller shortcuts keep their keys. Horizontal lists keep the
+browser's behavior. `autoFocus` focuses the viewport on mount, so a list
+opened from navigation scrolls with the keyboard right away.
+
+Band carried this in its vendored `virtua@0.50.0` copy (tjam `cf0bb2123`,
+`2225d1046`) before the release tarball replaced it. The focus ring stays in
+tjam, which styles each list through `className`.
+
+Tests: `react/VList.spec.tsx` (keyboard suite).
+
 ## Automation — `jam-rebase-patch.yml`, `jam-release.yml`
 
 - **`jam-rebase-patch.yml`** (weekly + dispatch): fetch upstream tags, newest
