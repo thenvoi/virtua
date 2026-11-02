@@ -1,14 +1,17 @@
-import { isIOSWebKit } from "./environment.js";
+import { isIOSWebKit, isWebKit } from "./environment.js";
 import {
   ACTION_SCROLL,
   type VirtualStore,
   ACTION_SCROLL_END,
   ACTION_START_OFFSET_CHANGE,
+  ACTION_USER_GESTURE,
   ACTION_MANUAL_SCROLL,
   ACTION_BEFORE_MANUAL_SMOOTH_SCROLL,
   ACTION_ITEM_RESIZE,
   ACTION_VIEWPORT_RESIZE,
+  ACTION_BURST_SETTLED,
   UPDATE_SIZE_EVENT,
+  UPDATE_VIRTUAL_STATE,
 } from "./store.js";
 import { type ItemResize } from "./types.js";
 import type { Layout } from "./layouts/types.js";
@@ -25,6 +28,12 @@ import {
   NULL,
   timeout,
 } from "./utils.js";
+
+// Plain scroll-end and burst quiescence retain upstream's 150 ms debounce.
+const SCROLL_END_DEBOUNCE = 150;
+// Fork delta 1: user WebKit tails release after 300 ms of scroll/wheel
+// signal silence, with no total duration budget (FORK-CHANGES.md delta 1).
+const SETTLE_STABILITY = 300;
 
 /**
  * Alignment of item in the viewport.
@@ -212,13 +221,42 @@ const createScrollObserver = (
   onMomentumJump?: (() => void) | null,
   getStartOffset?: () => number,
 ) => {
+  const now = Date.now;
+  let lastScrollTime = 0;
   let wheeling = false;
   let touching = false;
   let justTouchEnded = false;
   let stillMomentumScrolling = false;
   let cancelScroll: (() => void) | undefined;
+  // Every scroll or held wheel signal slides the settlement deadline.
+  let settleSignal = 0;
+  // Only user sessions extend settlement. Programmatic scrolling retains
+  // upstream's ordinary debounce.
+  let gestureSeen = false;
 
   let scrollEndTimer: ReturnType<typeof timeout> | undefined;
+  // The first burst window allows a delayed initial ResizeObserver delivery.
+  // Each subsequent correction rearms one window, batching the complete wave.
+  let burstEndTimer: ReturnType<typeof timeout> | undefined;
+  let burstWaveStarted = false;
+
+  const armBurstWindow = () => {
+    cancelTimeout(burstEndTimer);
+    burstEndTimer = timeout(
+      () => {
+        burstWaveStarted = false;
+        store.$update(ACTION_BURST_SETTLED);
+      },
+      burstWaveStarted ? SCROLL_END_DEBOUNCE : SCROLL_END_DEBOUNCE * 2,
+    );
+    burstWaveStarted = true;
+  };
+  // Arm once on the remap's async notify, then on each wave update until it
+  // goes quiet. While no burst is pending the callback does nothing, so an
+  // ordinary scroll never schedules a spurious commit.
+  const unsubscribeBurst = store.$subscribe(UPDATE_VIRTUAL_STATE, () => {
+    if (store.$isBurstPending()) armBurstWindow();
+  });
 
   const scrollOffsetKey = isHorizontal ? "scrollLeft" : "scrollTop";
   const scrollToKey = isHorizontal ? "left" : "top";
@@ -260,16 +298,28 @@ const createScrollObserver = (
     } else {
       justTouchEnded = false;
 
+      store.$update(ACTION_USER_GESTURE, false);
+      // User WebKit sessions retain their correction hold until every
+      // scroll and wheel signal has been silent for the stability window.
+      if (isWebKit() && gestureSeen && store.$isSettleHeld()) {
+        const silent = now() - settleSignal;
+        if (silent < SETTLE_STABILITY) {
+          scrollEndTimer = timeout(onScrollEnd, SETTLE_STABILITY - silent);
+          return;
+        }
+      }
       store.$update(ACTION_SCROLL_END);
+      gestureSeen = false;
     }
   };
   const scheduleScrollEnd = () => {
     cancelTimeout(scrollEndTimer);
-    scrollEndTimer = timeout(onScrollEnd, 150);
+    scrollEndTimer = timeout(onScrollEnd, SCROLL_END_DEBOUNCE);
   };
 
   const onScroll = () => {
     wheeling = false;
+    lastScrollTime = settleSignal = now();
 
     if (justTouchEnded) {
       stillMomentumScrolling = true;
@@ -287,6 +337,25 @@ const createScrollObserver = (
   // Infer scroll state also from wheel events
   // Sometimes scroll events do not fire when frame dropped even if the visual have been already scrolled
   const onWheel = ((e: WheelEvent) => {
+    // Report user activity before wheel inference. A WebKit momentum pulse
+    // may arrive just after a scroll debounce gap. Pinch zoom is not scrolling.
+    if (
+      !e.ctrlKey &&
+      (store.$isScrolling() ||
+        (isWebKit() && now() - lastScrollTime < SCROLL_END_DEBOUNCE))
+    ) {
+      store.$update(ACTION_USER_GESTURE, true);
+      gestureSeen = true;
+      // A resumed gesture takes ownership of any pending settlement timer.
+      settleSignal = now();
+      if (scrollEndTimer !== undefined) scheduleScrollEnd();
+    }
+    // Fold every user-session pulse into the deadline, including gaps that
+    // rearm the gesture flag and temporarily clear the store's settle hold.
+    if (isWebKit() && !e.ctrlKey && gestureSeen && store.$isScrolling()) {
+      settleSignal = now();
+      scheduleScrollEnd();
+    }
     if (
       // Scroll start should be detected with scroll event
       store.$isScrolling() &&
@@ -303,10 +372,18 @@ const createScrollObserver = (
 
   const onTouchStart = () => {
     touching = true;
+    store.$update(ACTION_USER_GESTURE, true);
+    gestureSeen = true;
+    // A resumed touch takes ownership of any pending settlement timer.
+    settleSignal = now();
+    if (scrollEndTimer !== undefined) scheduleScrollEnd();
     justTouchEnded = stillMomentumScrolling = false;
   };
   const onTouchEnd = () => {
     touching = false;
+    // iOS momentum is covered by the direction branch. Desktop wheels
+    // re-report activity; touch lift must not leave the seam active.
+    store.$update(ACTION_USER_GESTURE, false);
     if (isIOSWebKit()) {
       justTouchEnded = true;
     }
@@ -339,6 +416,8 @@ const createScrollObserver = (
       viewport.removeEventListener("touchend", onTouchEnd);
       viewport.removeEventListener("touchcancel", onTouchEnd);
       cancelTimeout(scrollEndTimer);
+      unsubscribeBurst();
+      cancelTimeout(burstEndTimer);
     },
     _fixScrollJump: () => {
       const [jump, shift] = store._flushJump();
@@ -484,7 +563,10 @@ export const createContainerDriver = (
   let length = 0;
 
   const mountedIndexes = new Map<HTMLElement, number>();
-  const reportedIndexes = new WeakMap<Element, number | undefined>();
+  const reportedItems = new WeakMap<
+    Element,
+    { index: number | undefined; size: number }
+  >();
 
   const resizeObserver = createResizeObserver((entries) => {
     const resizes: ItemResize[] = [];
@@ -504,13 +586,24 @@ export const createContainerDriver = (
         const index = mountedIndexes.get(target as HTMLElement);
         // https://github.com/inokawa/virtua/issues/417
         // https://github.com/inokawa/virtua/issues/885
-        const prevIndex = reportedIndexes.get(target);
-        reportedIndexes.set(target, index);
+        const previous = reportedItems.get(target);
         const size = isHorizontal ? width : height;
         if (index != NULL && !layout.$isSizeEqual(index, size)) {
-          (prevIndex != NULL && prevIndex !== index ? reindexed : resizes).push(
-            [index, size],
-          );
+          // Suppress cache reassignment, not genuine growth after the cache
+          // already follows this element's previous measured geometry.
+          (previous &&
+          previous.index != NULL &&
+          previous.index !== index &&
+          !layout.$isSizeEqual(index, previous.size)
+            ? reindexed
+            : resizes
+          ).push([index, size]);
+        }
+        if (previous) {
+          previous.index = index;
+          previous.size = size;
+        } else {
+          reportedItems.set(target, { index, size });
         }
       }
     }
@@ -632,7 +725,10 @@ export const createWindowDriver = (
   let length = 0;
 
   const mountedIndexes = new Map<HTMLElement, number>();
-  const reportedIndexes = new WeakMap<Element, number | undefined>();
+  const reportedItems = new WeakMap<
+    Element,
+    { index: number | undefined; size: number }
+  >();
 
   const resizeObserver = createResizeObserver((entries) => {
     const resizes: ItemResize[] = [];
@@ -650,13 +746,22 @@ export const createWindowDriver = (
         const index = mountedIndexes.get(target as HTMLElement);
         // https://github.com/inokawa/virtua/issues/417
         // https://github.com/inokawa/virtua/issues/885
-        const prevIndex = reportedIndexes.get(target);
-        reportedIndexes.set(target, index);
+        const previous = reportedItems.get(target);
         const size = isHorizontal ? width : height;
         if (index != NULL && !layout.$isSizeEqual(index, size)) {
-          (prevIndex != NULL && prevIndex !== index ? reindexed : resizes).push(
-            [index, size],
-          );
+          (previous &&
+          previous.index != NULL &&
+          previous.index !== index &&
+          !layout.$isSizeEqual(index, previous.size)
+            ? reindexed
+            : resizes
+          ).push([index, size]);
+        }
+        if (previous) {
+          previous.index = index;
+          previous.size = size;
+        } else {
+          reportedItems.set(target, { index, size });
         }
       }
     }

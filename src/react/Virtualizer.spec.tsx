@@ -1,4 +1,5 @@
-import { it, expect, describe } from "vitest";
+import { it, expect, describe, vi } from "vitest";
+import { act } from "@testing-library/react";
 import { Virtualizer } from "./Virtualizer.js";
 import { forwardRef } from "react";
 import { type CustomItemComponentProps } from "./types.js";
@@ -255,5 +256,85 @@ describe("horizontal", async () => {
       </div>,
     );
     expect(asFragment()).toMatchSnapshot();
+  });
+});
+
+// Ported from Band's vendored react/Virtualizer.test.tsx (delta 4).
+// jsdom's global ResizeObserver stub never fires without setupResizeJsDom, so the
+// real viewport-measurement path never completes and $getRange would otherwise
+// always return an empty range. Passing `ssrCount` gives the store a non-empty
+// initial `_prevRange` that it never recomputes without a real measured viewport
+// (see core/store.ts $getRange / _isViewportMeasured), which is exactly the
+// stable, unmeasured-viewport condition this suite needs to observe repeated
+// renders of the same mounted rows without a real browser layout engine.
+describe("Virtualizer element cache (FORK-CHANGES.md delta 4)", () => {
+  it("reuses a mounted row's element across a same-render-function re-render, and recomputes it when the render function identity changes", async () => {
+    const data = ["a", "b", "c"];
+    const rendererA = vi.fn((item: string, index: number) => (
+      <div data-testid={`row-${index}`}>{item}</div>
+    ));
+    const rendererB = vi.fn((item: string, index: number) => (
+      <div data-testid={`row-${index}`}>{item}</div>
+    ));
+
+    function Harness({ renderer }: { renderer: typeof rendererA }) {
+      return (
+        <Virtualizer data={data} ssrCount={data.length}>
+          {renderer}
+        </Virtualizer>
+      );
+    }
+
+    const { rerender } = await render(<Harness renderer={rendererA} />);
+    expect(rendererA).toHaveBeenCalledTimes(3);
+
+    // A re-render with the identical render-function/data identity models the
+    // "Virtualizer-only" case (a native scroll/resize re-render, or here a
+    // forced parent re-render with stable props): nothing this row's rendered
+    // output depends on changed, so a cache hit must skip invoking the render
+    // function again for any mounted index.
+    rendererA.mockClear();
+    act(() => {
+      rerender(<Harness renderer={rendererA} />);
+    });
+    expect(rendererA).toHaveBeenCalledTimes(0);
+
+    // Swapping the render-function identity models any consumer input changing
+    // (highlight, question, artifact, callback — an unmemoized row closure
+    // produces a fresh function reference here). Every mounted row must be
+    // recomputed fresh.
+    act(() => {
+      rerender(<Harness renderer={rendererB} />);
+    });
+    expect(rendererB).toHaveBeenCalledTimes(3);
+  });
+
+  it("recomputes mounted rows when the data identity changes under the same render function", async () => {
+    const renderer = vi.fn((item: string, index: number) => (
+      <div data-testid={`row-${index}`}>{item}</div>
+    ));
+
+    function Harness({ data }: { data: string[] }) {
+      return (
+        <Virtualizer data={data} ssrCount={data.length}>
+          {renderer}
+        </Virtualizer>
+      );
+    }
+
+    const { rerender, getByTestId } = await render(
+      <Harness data={["a", "b", "c"]} />,
+    );
+    expect(getByTestId("row-0").textContent).toBe("a");
+
+    // The same render function with a new data array: the cache must not
+    // serve the rows built from the previous array at the same indices.
+    renderer.mockClear();
+    act(() => {
+      rerender(<Harness data={["x", "y", "z"]} />);
+    });
+    expect(renderer).toHaveBeenCalledTimes(3);
+    expect(getByTestId("row-0").textContent).toBe("x");
+    expect(getByTestId("row-2").textContent).toBe("z");
   });
 });

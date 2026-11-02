@@ -1,5 +1,6 @@
-import { isIOSWebKit } from "./environment.js";
-import type { Layout } from "./layouts/types.js";
+import { UNCACHED } from "./cache.js";
+import { isIOSWebKit, isWebKit } from "./environment.js";
+import type { ItemSizeEstimator, Layout } from "./layouts/types.js";
 import type { ItemResize, ItemsRange } from "./types.js";
 import { abs, max, min, NULL } from "./utils.js";
 
@@ -37,6 +38,24 @@ export const ACTION_START_OFFSET_CHANGE = 7;
 export const ACTION_MANUAL_SCROLL = 8;
 /** @internal */
 export const ACTION_BEFORE_MANUAL_SMOOTH_SCROLL = 9;
+/** @internal */
+export const ACTION_ITEM_SIZE_ESTIMATOR_CHANGE = 10;
+/**
+ * Fork delta 1 seam: wheel/touch activity reported by the scroll observer.
+ * Desktop WebKit reverts position writes DURING a user gesture; #942's
+ * relative writes remain correct for programmatic scrolls, so the deferral
+ * is keyed on the gesture, not on scroll direction.
+ * @internal
+ */
+export const ACTION_USER_GESTURE = 11;
+/**
+ * Fork delta 7 seam: the burst quiescence window elapsed after a
+ * remap-transaction re-point. The scroll observer owns the timing and
+ * dispatches this once the measurement wave has gone quiet; it does not
+ * preempt an active gesture/settle hold, whose release owns the commit.
+ * @internal
+ */
+export const ACTION_BURST_SETTLED = 12;
 
 type Actions =
   | [type: typeof ACTION_SCROLL, offset: number, startOffset?: number]
@@ -55,7 +74,13 @@ type Actions =
   | [type: typeof ACTION_RELAYOUT, jump: number]
   | [type: typeof ACTION_START_OFFSET_CHANGE, offset: number]
   | [type: typeof ACTION_MANUAL_SCROLL, dummy?: void]
-  | [type: typeof ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, offset: number];
+  | [type: typeof ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, offset: number]
+  | [
+      type: typeof ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
+      estimator: ItemSizeEstimator | null,
+    ]
+  | [type: typeof ACTION_USER_GESTURE, active: boolean]
+  | [type: typeof ACTION_BURST_SETTLED, dummy?: void];
 
 /** @internal */
 export const UPDATE_VIRTUAL_STATE = 0b0001;
@@ -112,12 +137,40 @@ export type VirtualStore = {
   $getItemOffset(index: number): number;
   $getScrollOffset(): number;
   $isScrolling(): boolean;
+  /**
+   * Fork delta 7 seam: true while a successful remap's measurement wave is
+   * awaiting its batched commit. The scroll observer times the quiescence
+   * window; the store stays synchronous.
+   */
+  $isBurstPending(): boolean;
+  /**
+   * True while native WebKit corrections await momentum settlement.
+   * Imperative operations retain their own release contract.
+   * The observer owns timing and the store stays synchronous.
+   */
+  $isSettleHeld(): boolean;
   $getViewportSize(): number;
   $getStartSpacerSize(): number;
   $getTotalSize(): number;
+  /**
+   * Rebuild the measured-size cache from the previous identity order (fork
+   * delta 6). Returns false when the store cannot prove the source is safe,
+   * including while automatic item-size estimation is active or the layout
+   * cannot remap its sizes.
+   */
+  $remapItems(args: {
+    previousLength: number;
+    order: readonly number[];
+  }): boolean;
   _flushJump(): [number, boolean];
   $subscribe(target: number, cb: Subscriber): () => void;
   $update(...action: Actions): void;
+};
+
+type RetainedLengthChange = {
+  fromLength: number;
+  toLength: number;
+  sizes: readonly number[];
 };
 
 /**
@@ -134,6 +187,9 @@ export const createVirtualStore = (
     $getLength: getLength,
     $setLength: setLength,
     $isEstimating: isEstimating,
+    $setEstimator: setEstimator,
+    $remapSource: getSizes,
+    $replaceSizes: replaceSizes,
   }: Layout,
   ssrCount: number = 0,
 ): VirtualStore => {
@@ -146,10 +202,18 @@ export const createVirtualStore = (
   let pendingJump = 0;
   let _flushedJump = 0;
   let _scrollDirection: ScrollDirection = SCROLL_IDLE;
+  // WebKit deferral follows user gestures, not programmatic scroll direction.
+  let _userGestureActive = false;
+  // A gesture released into motion retains its correction hold until the
+  // observer reports settlement after scroll and wheel signal silence.
+  let _awaitingSettle = false;
+  // Remapped rows remeasure as a wave, committed at observer quiescence.
+  let _burstPending = false;
   let _scrollMode: ScrollMode = SCROLL_BY_NATIVE;
   let _frozenRange: ItemsRange | null = NULL;
   let _prevRange: ItemsRange = [0, isSSR ? max(ssrCount - 1, 0) : -1];
   let _isViewportMeasured = false;
+  let retainedLengthChange: RetainedLengthChange | null = null;
 
   const subscribers = new Set<[number, Subscriber]>();
   const getRelativeScrollOffset = () => scrollOffset - startSpacerSize;
@@ -170,14 +234,42 @@ export const createVirtualStore = (
 
   const applyJump = (j: number) => {
     if (j) {
-      if (
-        // In iOS WebKit browsers, updating scroll position will stop scrolling so it have to be deferred during scrolling.
+      const deferredByGesture =
+        // In iOS WebKit browsers, updating scroll position will stop scrolling
+        // so it have to be deferred during scrolling.
         (isIOSWebKit() && _scrollDirection !== SCROLL_IDLE) ||
+        // Desktop WebKit can revert writes during gestures and momentum.
+        // Imperative operations keep their independent release contract.
+        (isWebKit() &&
+          (_userGestureActive ||
+            (_awaitingSettle && _scrollMode === SCROLL_BY_NATIVE)));
+      // Only remap transactions batch ordinary measurement waves.
+      const deferredByBurst = _burstPending;
+      if (
+        deferredByGesture ||
+        deferredByBurst ||
         // Before imperative smooth scrolling, we measure all items which may be visible during scrolling.
         // However, especially in Firefox, there are rare cases where items resize while scrolling, which can stop smooth scrolling.
         (_frozenRange && _scrollMode === SCROLL_BY_MANUAL_SCROLL)
       ) {
         pendingJump += j;
+        // Outside native WebKit holds, a viewport-sized backlog escapes in
+        // full. Never clip correction debt or release a frozen manual range.
+        if (
+          (deferredByGesture || deferredByBurst) &&
+          viewportSize &&
+          abs(pendingJump) > viewportSize &&
+          // Native gestures and momentum require zero writes even when the
+          // parked correction exceeds one viewport.
+          !(
+            isWebKit() &&
+            _scrollMode === SCROLL_BY_NATIVE &&
+            (_userGestureActive || _awaitingSettle)
+          )
+        ) {
+          jump += pendingJump;
+          pendingJump = 0;
+        }
       } else {
         jump += j;
       }
@@ -214,6 +306,79 @@ export const createVirtualStore = (
       anchorIndex++;
     }
     return anchorIndex;
+  };
+
+  // Fork delta 6: rebuild the size cache from the caller's previous identity
+  // order. Each new index points at its previous index or -1.
+  const remapItems = ({
+    previousLength,
+    order,
+  }: {
+    previousLength: number;
+    order: readonly number[];
+  }): boolean => {
+    if (
+      !replaceSizes ||
+      !getSizes ||
+      isEstimating() ||
+      order.length !== getLength()
+    ) {
+      return false;
+    }
+
+    const source =
+      previousLength === getLength()
+        ? getSizes()
+        : retainedLengthChange &&
+            retainedLengthChange.fromLength === previousLength &&
+            retainedLengthChange.toLength === getLength() &&
+            retainedLengthChange.sizes.length === previousLength
+          ? retainedLengthChange.sizes
+          : undefined;
+    if (!source) return false;
+
+    const sizes = new Array<number>(getLength());
+    for (let index = 0; index < order.length; index++) {
+      const sourceIndex = order[index]!;
+      if (
+        !Number.isInteger(sourceIndex) ||
+        sourceIndex < -1 ||
+        sourceIndex >= source.length
+      ) {
+        return false;
+      }
+      const size = sourceIndex === -1 ? UNCACHED : source[sourceIndex]!;
+      if (size !== UNCACHED && !Number.isFinite(size)) return false;
+      sizes[index] = size;
+    }
+
+    replaceSizes(sizes);
+    if (previousLength !== getLength()) {
+      retainedLengthChange = null;
+    }
+    // Reorders invalidate corrections computed for old identities. Retain
+    // only a completing shift transaction or a same-length identity mapping.
+    // A length difference alone does not prove a correction belongs here.
+    const isCompletingShiftGrowth =
+      previousLength !== getLength() && _scrollMode === SCROLL_BY_SHIFT;
+    const isIdentityReorder =
+      !isCompletingShiftGrowth &&
+      previousLength === getLength() &&
+      order.every((sourceIndex, index) => sourceIndex === index);
+    if (!isCompletingShiftGrowth && !isIdentityReorder) {
+      jump = 0;
+      pendingJump = 0;
+    }
+    _flushedJump = 0;
+    _frozenRange = NULL;
+    _scrollMode = SCROLL_BY_NATIVE;
+    // Arm before notifying so the observer times this remap's complete wave.
+    _burstPending = true;
+    stateVersion = (stateVersion & MAX_INT_32) + 1;
+    subscribers.forEach(([target, cb]) => {
+      if (target & UPDATE_VIRTUAL_STATE) cb(false);
+    });
+    return true;
   };
 
   return {
@@ -267,9 +432,12 @@ export const createVirtualStore = (
     },
     $getScrollOffset: () => scrollOffset,
     $isScrolling: () => _scrollDirection !== SCROLL_IDLE,
+    $isBurstPending: () => _burstPending,
+    $isSettleHeld: () => _awaitingSettle && _scrollMode === SCROLL_BY_NATIVE,
     $getViewportSize: () => viewportSize,
     $getStartSpacerSize: () => startSpacerSize,
     $getTotalSize: getTotalSize,
+    $remapItems: remapItems,
     _flushJump: () => {
       _flushedJump = jump;
       jump = 0;
@@ -285,6 +453,7 @@ export const createVirtualStore = (
     $update: (type, payload, payload2?): void => {
       let shouldSync: boolean | undefined;
       let mutated = 0;
+      let shouldFlushPendingJump = false;
 
       switch (type) {
         case ACTION_SCROLL: {
@@ -344,18 +513,41 @@ export const createVirtualStore = (
             // Update synchronously if scrolled a lot
             shouldSync = distance > viewportSize;
           }
+
+          // At the physical start edge, parked debt displaces every row.
+          // Clear it immediately without a scroll write or an early hold
+          // release. The shared flush path covers edges without scroll events.
+          if (pendingJump && relativeOffset + jump <= 0) {
+            pendingJump = 0;
+            if (!(mutated & UPDATE_VIRTUAL_STATE)) {
+              // Recompute from geometry at the browser-owned position.
+              mutated += UPDATE_VIRTUAL_STATE;
+            }
+          }
           break;
         }
         case ACTION_SCROLL_END: {
           mutated = UPDATE_SCROLL_END_EVENT;
-          if (_scrollDirection !== SCROLL_IDLE) {
-            jump += pendingJump;
-            pendingJump = 0;
+          // Native mode can park a backlog without a position change.
+          // Imperative modes retain the direction gate so a frozen-range
+          // correction cannot obscure the next operation's destination.
+          if (
+            _scrollDirection !== SCROLL_IDLE ||
+            _scrollMode === SCROLL_BY_NATIVE
+          ) {
+            // A scroll-end predating a remap cannot commit its partial wave.
+            if (!_burstPending) {
+              shouldFlushPendingJump = true;
+            }
             mutated += UPDATE_VIRTUAL_STATE;
           }
+          // Settlement releases gesture state even while a burst owns debt.
           _scrollDirection = SCROLL_IDLE;
           _scrollMode = SCROLL_BY_NATIVE;
           _frozenRange = NULL;
+          _userGestureActive = false;
+          _awaitingSettle = false;
+          // Only the burst-quiescence timer disarms a live remap wave.
           break;
         }
         case ACTION_ITEM_RESIZE: {
@@ -391,6 +583,14 @@ export const createVirtualStore = (
         }
         case ACTION_ITEMS_LENGTH_CHANGE: {
           if (payload !== getLength()) {
+            // Fork delta 6: retain the exact pre-change window for the remap
+            // completing this transaction. A no-op render dispatch must not
+            // supersede that window.
+            retainedLengthChange = {
+              fromLength: getLength(),
+              toLength: payload,
+              sizes: getSizes ? getSizes().slice() : [],
+            };
             if (payload2) {
               const totalSize = getTotalSize();
               setLength(payload, true);
@@ -411,6 +611,27 @@ export const createVirtualStore = (
           mutated = UPDATE_VIRTUAL_STATE;
           break;
         }
+        case ACTION_USER_GESTURE: {
+          _userGestureActive = payload;
+          // Each gesture takes ownership anew. Releasing into motion arms
+          // the momentum hold, while an already-stable release does not.
+          _awaitingSettle = payload ? false : _scrollDirection !== SCROLL_IDLE;
+          break;
+        }
+        case ACTION_BURST_SETTLED: {
+          // Release through the shared flush path unless a gesture, momentum,
+          // or frozen manual range still owns the debt.
+          _burstPending = false;
+          if (
+            pendingJump &&
+            !(isWebKit() && (_userGestureActive || _awaitingSettle)) &&
+            !(_frozenRange && _scrollMode === SCROLL_BY_MANUAL_SCROLL)
+          ) {
+            shouldFlushPendingJump = true;
+            mutated |= UPDATE_VIRTUAL_STATE;
+          }
+          break;
+        }
         case ACTION_START_OFFSET_CHANGE: {
           if (payload !== startSpacerSize) {
             startSpacerSize = payload;
@@ -422,6 +643,20 @@ export const createVirtualStore = (
           _scrollMode = SCROLL_BY_MANUAL_SCROLL;
           break;
         }
+        case ACTION_ITEM_SIZE_ESTIMATOR_CHANGE: {
+          // Fork delta 5: an estimator swap is a geometry mutation. Use the
+          // same anchor as measurement and relayout, including shift and
+          // frozen-range modes, then pass its delta through the existing hold.
+          if (setEstimator) {
+            const anchorIndex = getAnchorIndex();
+            const anchorOffset = getItemOffset(anchorIndex);
+            if (setEstimator(payload)) {
+              applyJump(getItemOffset(anchorIndex) - anchorOffset);
+              mutated = UPDATE_VIRTUAL_STATE;
+            }
+          }
+          break;
+        }
         case ACTION_BEFORE_MANUAL_SMOOTH_SCROLL: {
           _frozenRange = getRange(payload, payload + viewportSize);
           mutated = UPDATE_VIRTUAL_STATE;
@@ -431,6 +666,16 @@ export const createVirtualStore = (
 
       if (mutated) {
         stateVersion = (stateVersion & MAX_INT_32) + 1;
+
+        if (shouldFlushPendingJump && pendingJump) {
+          // At or above the physical start edge, clear debt without writing.
+          // Retaining it would displace every item offset. Inside content,
+          // merge the entire backlog into one anchored correction.
+          if (getRelativeScrollOffset() + jump > 0) {
+            jump += pendingJump;
+          }
+          pendingJump = 0;
+        }
 
         subscribers.forEach(([target, cb]) => {
           // Early return to skip React's computation

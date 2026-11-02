@@ -12,7 +12,9 @@ import {
 import {
   UPDATE_SCROLL_EVENT,
   ACTION_ITEMS_LENGTH_CHANGE,
+  ACTION_ITEM_SIZE_ESTIMATOR_CHANGE,
   createVirtualStore,
+  type VirtualStore,
   createListLayout,
   UPDATE_VIRTUAL_STATE,
   UPDATE_SCROLL_END_EVENT,
@@ -26,7 +28,7 @@ import {
   sort,
 } from "../core/index.js";
 import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
-import { getKey } from "./utils.js";
+import { getKey, type ItemElement as RowElement } from "./utils.js";
 import { useStatic } from "./useStatic.js";
 import { useLatestRef } from "./useLatestRef.js";
 import { ListItem } from "./ListItem.js";
@@ -88,6 +90,21 @@ export interface VirtualizerHandle {
    * @param offset offset from current position
    */
   scrollBy(offset: number): void;
+  /**
+   * Rebuild measured item sizes from the previous identity order (fork delta 6).
+   *
+   * The caller supplies identity order only. Each new index points to its
+   * previous index or -1. Returns false when the store cannot prove the source
+   * is safe, including while automatic item-size estimation is active.
+   */
+  remapItems(args: {
+    previousLength: number;
+    order: readonly number[];
+  }): boolean;
+  /**
+   * Return whether an item has no measured size.
+   */
+  isUnmeasuredItem(index: number): boolean;
 }
 
 /**
@@ -113,9 +130,16 @@ export interface VirtualizerProps<T = unknown> {
    * Item size hint for unmeasured items in pixels. It will help to reduce scroll jump when items are measured if used properly.
    *
    * - If not set, initial item sizes will be automatically estimated from measured sizes. This is recommended for most cases.
-   * - If set, you can opt out estimation and use the value as initial item size.
+   * - If set to a number, you can opt out estimation and use the value as initial item size.
+   * - If set to a function, it is called with a raw mounted index (not a caller
+   *   identity/key) to price each still-unmeasured row individually. Must be
+   *   cheap/O(1) — it can run many times synchronously (offset walks, binary
+   *   search over a large unmeasured range). A non-finite or non-positive
+   *   result falls back to this store's own configured/default size, not any
+   *   caller-specific floor — callers needing a floor/ceiling must clamp
+   *   inside their own function. Fork delta 5, not upstream virtua.
    */
-  itemSize?: number;
+  itemSize?: number | ((index: number) => number);
   /**
    * Set true only when items are added to or removed from the start of the list, such as when older items are loaded in reverse infinite scrolling. In that case, the scroll position is maintained from the end of the list instead of the start.
    *
@@ -173,6 +197,75 @@ export interface VirtualizerProps<T = unknown> {
   onResize?: () => void;
 }
 
+const createRenderState = (
+  store: VirtualStore,
+  itemSize: VirtualizerProps["itemSize"],
+  ssrCount: VirtualizerProps["ssrCount"],
+) => {
+  let estimator = typeof itemSize === "function" ? itemSize : null;
+  let isSSR = !!ssrCount;
+  let renderer: ((index: number) => RowElement) | undefined;
+  let rows = new Map<number, RowElement>();
+  let nextRows = new Map<number, RowElement>();
+  return {
+    $isSSR: () => isSSR,
+    $mounted: () => {
+      isSSR = false;
+    },
+    $setEstimator: (next: typeof estimator) => {
+      if (estimator !== next) {
+        store.$update(ACTION_ITEM_SIZE_ESTIMATOR_CHANGE, next);
+        estimator = next;
+      }
+    },
+    $begin: (nextRenderer: typeof renderer) => {
+      if (renderer !== nextRenderer) {
+        renderer = nextRenderer;
+        rows.clear();
+      }
+      // A render that threw may have left partial work in the spare map.
+      nextRows.clear();
+    },
+    $get: (index: number) => {
+      let element = rows.get(index);
+      if (element === undefined) {
+        element = renderer!(index);
+      }
+      nextRows.set(index, element);
+      return element;
+    },
+    $end: () => {
+      rows.clear();
+      const previous = rows;
+      rows = nextRows;
+      nextRows = previous;
+    },
+  };
+};
+
+// Keep initializer captures outside the mount effect's shared closure so an
+// estimator replacement can release the first callback's closed-over data.
+const useVirtualizerState = (
+  count: number,
+  itemSize: VirtualizerProps["itemSize"],
+  cache: VirtualizerProps["cache"],
+  ssrCount: VirtualizerProps["ssrCount"],
+  horizontalProp: VirtualizerProps["horizontal"],
+) =>
+  useStatic(() => {
+    const isHorizontal = !!horizontalProp;
+    const layout = createListLayout(count, itemSize, cache);
+    const store = createVirtualStore(layout, ssrCount);
+    const renderState = createRenderState(store, itemSize, ssrCount);
+    return [
+      store,
+      layout,
+      createContainerDriver(store, layout, isHorizontal),
+      isHorizontal,
+      renderState,
+    ] as const;
+  });
+
 /**
  * Customizable list virtualizer for advanced usage. See {@link VirtualizerProps} and {@link VirtualizerHandle}.
  */
@@ -212,26 +305,24 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
 
     const containerRef = useRef<HTMLDivElement>(null);
 
-    const isSSR = useRef(!!ssrCount);
-
     const onScroll = useLatestRef(onScrollProp);
     const onScrollEnd = useLatestRef(onScrollEndProp);
     const onResize = useLatestRef(onResizeProp);
 
-    const [store, layout, driver, isHorizontal] = useStatic(() => {
-      const _isHorizontal = !!horizontalProp;
-      const _layout = createListLayout(count, itemSize, cache);
-      const _store = createVirtualStore(_layout, ssrCount);
-      return [
-        _store,
-        _layout,
-        createContainerDriver(_store, _layout, _isHorizontal),
-        _isHorizontal,
-      ];
-    });
+    const [store, layout, driver, isHorizontal, renderState] =
+      useVirtualizerState(count, itemSize, cache, ssrCount, horizontalProp);
 
-    // The elements length and cached items length are different just after element is added/removed.
-    store.$update(ACTION_ITEMS_LENGTH_CHANGE, count, shift);
+    // Prepend and shrink consume the old estimator's index space first.
+    // Plain growth installs the new estimator before pricing added rows.
+    const itemSizeEstimator = typeof itemSize === "function" ? itemSize : null;
+    const lengthFirst = shift || count < layout.$getLength();
+    if (lengthFirst) {
+      store.$update(ACTION_ITEMS_LENGTH_CHANGE, count, shift);
+    }
+    renderState.$setEstimator(itemSizeEstimator);
+    if (!lengthFirst) {
+      store.$update(ACTION_ITEMS_LENGTH_CHANGE, count, shift);
+    }
     store.$update(ACTION_START_OFFSET_CHANGE, startMargin);
 
     const [stateVersion, rerender] = useReducer(
@@ -246,7 +337,7 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
     const items: ReactElement[] = [];
 
     useIsomorphicLayoutEffect(() => {
-      isSSR.current = false;
+      renderState.$mounted();
 
       // store must be subscribed first because others may dispatch update on init depending on implementation
       store.$subscribe(UPDATE_VIRTUAL_STATE, (sync) => {
@@ -312,8 +403,21 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
           driver.$scroll(undefined, {
             offset: offset + store.$getScrollOffset(),
           }),
+        remapItems: store.$remapItems,
+        isUnmeasuredItem: layout.$isSizeEqual,
       };
     }, []);
+
+    // Fork delta 4: reuse each mounted row's element across Virtualizer-only
+    // re-renders (native scroll, resize, etc.) so an unchanged row keeps the
+    // same `_children` identity and ListItem's memo can bail. useChildren
+    // returns a new `renderElement` whenever `children` or `data` changes, i.e.
+    // every input a row depends on, and that resets the cache. Two maps
+    // alternate each render, dropping unmounted indices without allocating
+    // an eviction set. The isolated state owner retains only current inputs,
+    // not the component's initial rendering closure (#1030).
+    renderState.$begin(renderElement);
+    const isSSR = renderState.$isSSR();
 
     const indexes: number[] = [];
     if (keepMounted) {
@@ -332,7 +436,7 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
       }
     }
     for (const index of indexes) {
-      const e = renderElement(index);
+      const e = renderState.$get(index);
       items.push(
         <ListItem
           key={getKey(e, index)}
@@ -343,10 +447,11 @@ export const Virtualizer = /*#__PURE__*/ forwardRef<
           _as={ItemElement as "div"}
           _children={e}
           _isHorizontal={isHorizontal}
-          _isSSR={isSSR.current}
+          _isSSR={isSSR}
         />,
       );
     }
+    renderState.$end();
 
     return (
       <Element
